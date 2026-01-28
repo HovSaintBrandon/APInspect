@@ -1,0 +1,27 @@
+{
+    "base_url": "https://jsonplaceholder.typicode.com",
+    "auth": {
+        "type": "bearer",
+        "token": "placeholder-token"
+    },
+    "endpoints": [
+        {
+            "path": "/posts/1",
+            "methods": [
+                "GET"
+            ]
+        },
+        {
+            "path": "/users/1",
+            "methods": [
+                "GET"
+            ]
+        },
+        {
+            "path": "/invalid-endpoint-test",
+            "methods": [
+                "GET"
+            ]
+        }
+    ]
+}
