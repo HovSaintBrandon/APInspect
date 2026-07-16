@@ -10,10 +10,28 @@ const generate = (results, outputPath) => {
             summary: {
                 total: results.length,
                 passed: results.filter(r => r.status === 'PASS').length,
-                failed: results.filter(r => r.status === 'FAIL').length,
+                failed: results.filter(r => r.status === 'FAIL' || r.status === 'FAILED').length,
+                tbc: results.filter(r => r.status === 'TO BE CONFIRMED').length,
                 manual: results.filter(r => r.status === 'MANUAL').length,
+                na: results.filter(r => r.status === 'N/A').length,
             },
-            results: results
+            results: results.map(r => ({
+                check: r.check,
+                endpoint: r.endpoint,
+                method: r.method,
+                status: r.status,
+                severity: r.severity || 'Info',
+                confirmation_status: r.confirmation_status || 'confirmed',
+                message: r.message,
+                details: r.details,
+                // AI fields: only included when present (undefined fields are
+                // stripped by JSON.stringify, keeping non-AI results clean)
+                ...(r.ai_confidence !== undefined && {
+                    ai_confidence: r.ai_confidence,
+                    ai_reasoning: r.ai_reasoning,
+                    evidence_cited: r.evidence_cited,
+                }),
+            }))
         }, null, 2);
 
         // Ensure dir exists

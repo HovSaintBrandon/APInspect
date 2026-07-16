@@ -64,7 +64,7 @@ const extractPostmanEndpoints = (items, variables = []) => {
     return endpoints;
 };
 
-const parse = async (filePath) => {
+const parse = async (filePath, cliBaseUrl = null) => {
     try {
         const absolutePath = path.resolve(filePath);
         if (!fs.existsSync(absolutePath)) {
@@ -89,13 +89,29 @@ const parse = async (filePath) => {
             const baseUrlVar = variables.find(v => v.key === 'baseUrl');
 
             // Try to determine base URL
-            // 1. From variable
-            // 2. Default to localhost
-            if (baseUrlVar) {
+            // 1. From CLI flag
+            // 2. From variable
+            // 3. Prompt user interactively
+            if (cliBaseUrl) {
+                config.base_url = cliBaseUrl;
+            } else if (baseUrlVar) {
                 config.base_url = baseUrlVar.value;
             } else {
-                config.base_url = 'http://localhost';
-                logger.warn('No {{baseUrl}} variable found. Defaulting to http://localhost');
+                const readline = require('readline');
+                const askBaseUrl = () => {
+                    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+                    return new Promise(resolve => {
+                        logger.warn('No {{baseUrl}} variable found in collection.');
+                        rl.question('? Enter the base URL for the scan (e.g., http://localhost:3000): ', ans => {
+                            rl.close();
+                            resolve(ans.trim());
+                        });
+                    });
+                };
+                
+                const answer = await askBaseUrl();
+                config.base_url = answer || 'http://localhost';
+                logger.info(`Using base URL: ${config.base_url}`);
             }
 
             // Clean trailing slash

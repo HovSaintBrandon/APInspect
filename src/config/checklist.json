@@ -1,0 +1,218 @@
+[
+  {
+    "id": "DISC-01",
+    "category": "Discovery",
+    "severity": "Info",
+    "test_name": "Identify all accessible API endpoints and verify they are documented.",
+    "maps_to_check": "discovery/endpointDiscovery",
+    "requires_ai_probe": false
+  },
+  {
+    "id": "DISC-02",
+    "category": "Discovery",
+    "severity": "Info",
+    "test_name": "Enumerate HTTP methods allowed per endpoint and flag dangerous methods (TRACE, CONNECT).",
+    "maps_to_check": "discovery/httpMethods",
+    "requires_ai_probe": false
+  },
+  {
+    "id": "AUTH-01",
+    "category": "Authentication",
+    "severity": "Critical",
+    "test_name": "Ensure all API endpoints are protected by proper authentication mechanisms.",
+    "maps_to_check": "authentication/authRequired",
+    "requires_ai_probe": false
+  },
+  {
+    "id": "AUTH-02",
+    "category": "Authentication",
+    "severity": "Critical",
+    "test_name": "Verify that authentication tokens are validated server-side and not merely checked client-side.",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "AUTH-03",
+    "category": "Authentication",
+    "severity": "Critical",
+    "test_name": "Test for broken object-level authorization — access another user's objects by manipulating IDs.",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "INJ-01",
+    "category": "Injection",
+    "severity": "Critical",
+    "test_name": "Fuzz parameters for SQL injection and Cross-Site Scripting (XSS) payloads.",
+    "maps_to_check": "injection/sqliXss",
+    "requires_ai_probe": false
+  },
+  {
+    "id": "INJ-02",
+    "category": "Injection",
+    "severity": "High",
+    "test_name": "Test for path traversal vulnerabilities in file-serving or path-parameter endpoints.",
+    "maps_to_check": "injection/pathTraversal",
+    "requires_ai_probe": false
+  },
+  {
+    "id": "INJ-03",
+    "category": "Injection",
+    "severity": "Critical",
+    "test_name": "Test for Server-Side Request Forgery (SSRF) by injecting internal URLs into URL parameters.",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "DATA-01",
+    "category": "Data Exposure",
+    "severity": "High",
+    "test_name": "Scan response bodies for regex-detectable sensitive data (PII, credentials, tokens, API keys).",
+    "maps_to_check": "dataExposure/sensitiveData",
+    "requires_ai_probe": false
+  },
+  {
+    "id": "DATA-02",
+    "category": "Data Exposure",
+    "severity": "High",
+    "test_name": "Use AI to detect subtle or contextually sensitive data exposure not caught by static patterns.",
+    "maps_to_check": "dataExposure/sensitiveDataAI",
+    "requires_ai_probe": false
+  },
+  {
+    "id": "DATA-03",
+    "category": "Data Exposure",
+    "severity": "Medium",
+    "test_name": "Verify that responses do not return excessive data fields beyond what the client requested.",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "MISC-01",
+    "category": "Misconfigurations",
+    "severity": "Medium",
+    "test_name": "Audit CORS policy for wildcard origins or reflected origins with credentials enabled.",
+    "maps_to_check": "misconfigurations/cors",
+    "requires_ai_probe": false
+  },
+  {
+    "id": "MISC-02",
+    "category": "Misconfigurations",
+    "severity": "Low",
+    "test_name": "Verify presence and correct configuration of HTTP security headers (HSTS, CSP, X-Frame-Options).",
+    "maps_to_check": "misconfigurations/securityHeaders",
+    "requires_ai_probe": false
+  },
+  {
+    "id": "ERR-01",
+    "category": "Error Handling",
+    "severity": "Medium",
+    "test_name": "Send malformed requests to trigger application errors and check for stack trace or path disclosure.",
+    "maps_to_check": "errorHandling/stackTrace",
+    "requires_ai_probe": false
+  },
+  {
+    "id": "RATE-01",
+    "category": "Rate Limiting",
+    "severity": "Medium",
+    "test_name": "Send a burst of parallel requests to verify the API enforces rate limiting (429 Too Many Requests).",
+    "maps_to_check": "rateLimiting/bruteForce",
+    "requires_ai_probe": false
+  },
+  {
+    "id": "RATE-02",
+    "category": "Rate Limiting",
+    "severity": "Medium",
+    "test_name": "Verify that rate limiting applies per-user and cannot be bypassed by rotating IP headers (X-Forwarded-For).",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "MASSASSIGN-01",
+    "category": "Mass Assignment",
+    "severity": "High",
+    "test_name": "Test for mass assignment vulnerabilities by sending unexpected or privileged parameters in request bodies.",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "MASSASSIGN-02",
+    "category": "Mass Assignment",
+    "severity": "High",
+    "test_name": "Verify that write operations reject or ignore unexpected fields not in the API schema.",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "BIZLOGIC-01",
+    "category": "Business Logic",
+    "severity": "Medium",
+    "test_name": "Test for transaction limit bypass — attempt to exceed defined thresholds through repeated or split operations.",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "BIZLOGIC-02",
+    "category": "Business Logic",
+    "severity": "Medium",
+    "test_name": "Verify workflow integrity — test that multi-step processes cannot be interrupted or skipped.",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "BIZLOGIC-03",
+    "category": "Business Logic",
+    "severity": "Medium",
+    "test_name": "Test for negative value or boundary manipulation in numeric inputs (quantities, prices, scores).",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "WS-01",
+    "category": "WebSocket Security",
+    "severity": "High",
+    "test_name": "Verify WebSocket handshake enforces authentication (token in header or subprotocol).",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "WS-02",
+    "category": "WebSocket Security",
+    "severity": "Medium",
+    "test_name": "Test WebSocket messages for injection vulnerabilities and verify message-level authorization.",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "3P-01",
+    "category": "Third-Party Integration",
+    "severity": "Medium",
+    "test_name": "Verify that third-party webhook endpoints validate incoming payloads using signatures or secrets.",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "3P-02",
+    "category": "Third-Party Integration",
+    "severity": "Low",
+    "test_name": "Ensure that error responses from third-party integrations do not leak upstream system details.",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "CICD-01",
+    "category": "CI/CD & Infrastructure",
+    "severity": "High",
+    "test_name": "Verify that API keys and secrets are not present in response bodies or headers.",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  },
+  {
+    "id": "CICD-02",
+    "category": "CI/CD & Infrastructure",
+    "severity": "Medium",
+    "test_name": "Confirm that staging/debug endpoints are not exposed in the production environment.",
+    "maps_to_check": null,
+    "requires_ai_probe": true
+  }
+]

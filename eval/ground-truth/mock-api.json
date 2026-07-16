@@ -1,0 +1,34 @@
+{
+  "target": "mock-server",
+  "base_url": "http://localhost:3001",
+  "cases": [
+    {
+      "endpoint": "/api/injection-test",
+      "method": "GET",
+      "check_id": "DATA-02",
+      "expected_verdict": "MANUAL",
+      "notes": "No captured response available for AI analysis — check correctly returns MANUAL. Confirmation axis: to_be_confirmed."
+    },
+    {
+      "endpoint": "/api/users/profile",
+      "method": "GET",
+      "check_id": "AUTH-01",
+      "expected_verdict": "MANUAL",
+      "notes": "No auth config provided to mock scan — check correctly returns MANUAL (Critical severity, to_be_confirmed). Used to test --fail-on-tbc composability."
+    },
+    {
+      "endpoint": "/api/users/export",
+      "method": "GET",
+      "check_id": "DATA-01",
+      "expected_verdict": "FAILED",
+      "notes": "Exposes SSN and JWT. Hardcoded regex check detects sensitive data — confirmed FAIL at High severity."
+    },
+    {
+      "endpoint": "/api/login",
+      "method": "POST",
+      "check_id": "RATE-01",
+      "expected_verdict": "PASS",
+      "notes": "Properly returns 429 when rate limit is exceeded. Confirmed PASS."
+    }
+  ]
+}

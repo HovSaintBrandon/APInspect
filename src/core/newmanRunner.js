@@ -44,7 +44,7 @@ const extractSnippet = (text, keyword) => {
     return text.substring(start, start + 120) + '...';
 };
 
-const runAudit = (collectionPath, environmentPath) => {
+const runAudit = (collectionPath, environmentPath, context = null) => {
     logger.title('Starting Newman-based Response Audit...');
 
     // Resolve paths
@@ -84,6 +84,26 @@ const runAudit = (collectionPath, environmentPath) => {
         // response.text() or response.stream.toString() depending on version
         // args.response.stream is a Buffer
         const body = response.stream ? response.stream.toString() : '';
+
+        // --- Evidence Store: populate for AI checks ---
+        // Keyed by "METHOD /path" to match context.getEvidenceFor()
+        if (context && context.evidenceStore) {
+            // Extract just the path portion for the key, stripping base URL
+            let pathKey = url;
+            try {
+                pathKey = new URL(url).pathname;
+            } catch (_) { /* non-standard URL, use raw */ }
+
+            const evidenceKey = `${method.toUpperCase()} ${pathKey}`;
+            context.evidenceStore.set(evidenceKey, {
+                url,
+                method: method.toUpperCase(),
+                responseHeaders: response.headers ? response.headers.members : [],
+                responseBody: body,
+                statusCode: status,
+            });
+        }
+        // ----------------------------------------------
 
         // 1. Check for insecure transport
         if (url.startsWith('http://') && !url.includes('localhost') && !url.includes('127.0.0.1')) {

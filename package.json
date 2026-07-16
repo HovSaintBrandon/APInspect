@@ -8,7 +8,8 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "eval": "node eval/run.js"
   },
   "keywords": [
     "api",
@@ -23,7 +24,11 @@
     "axios": "^1.6.0",
     "chalk": "^4.1.2",
     "commander": "^11.0.0",
+    "dotenv": "^17.4.2",
     "newman": "^6.2.2",
     "ora": "^5.4.1"
+  },
+  "devDependencies": {
+    "express": "^5.2.1"
   }
 }
