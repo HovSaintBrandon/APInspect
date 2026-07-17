@@ -5,7 +5,10 @@
     "severity": "Info",
     "test_name": "Identify all accessible API endpoints and verify they are documented.",
     "maps_to_check": "discovery/endpointDiscovery",
-    "requires_ai_probe": false
+    "requires_ai_probe": false,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "DISC-02",
@@ -13,7 +16,10 @@
     "severity": "Info",
     "test_name": "Enumerate HTTP methods allowed per endpoint and flag dangerous methods (TRACE, CONNECT).",
     "maps_to_check": "discovery/httpMethods",
-    "requires_ai_probe": false
+    "requires_ai_probe": false,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "AUTH-01",
@@ -21,7 +27,10 @@
     "severity": "Critical",
     "test_name": "Ensure all API endpoints are protected by proper authentication mechanisms.",
     "maps_to_check": "authentication/authRequired",
-    "requires_ai_probe": false
+    "requires_ai_probe": false,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "AUTH-02",
@@ -29,7 +38,10 @@
     "severity": "Critical",
     "test_name": "Verify that authentication tokens are validated server-side and not merely checked client-side.",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "AUTH-03",
@@ -37,7 +49,10 @@
     "severity": "Critical",
     "test_name": "Test for broken object-level authorization — access another user's objects by manipulating IDs.",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "INJ-01",
@@ -45,7 +60,10 @@
     "severity": "Critical",
     "test_name": "Fuzz parameters for SQL injection and Cross-Site Scripting (XSS) payloads.",
     "maps_to_check": "injection/sqliXss",
-    "requires_ai_probe": false
+    "requires_ai_probe": false,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "INJ-02",
@@ -53,7 +71,10 @@
     "severity": "High",
     "test_name": "Test for path traversal vulnerabilities in file-serving or path-parameter endpoints.",
     "maps_to_check": "injection/pathTraversal",
-    "requires_ai_probe": false
+    "requires_ai_probe": false,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "INJ-03",
@@ -61,7 +82,10 @@
     "severity": "Critical",
     "test_name": "Test for Server-Side Request Forgery (SSRF) by injecting internal URLs into URL parameters.",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "DATA-01",
@@ -69,7 +93,10 @@
     "severity": "High",
     "test_name": "Scan response bodies for regex-detectable sensitive data (PII, credentials, tokens, API keys).",
     "maps_to_check": "dataExposure/sensitiveData",
-    "requires_ai_probe": false
+    "requires_ai_probe": false,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "DATA-02",
@@ -77,7 +104,10 @@
     "severity": "High",
     "test_name": "Use AI to detect subtle or contextually sensitive data exposure not caught by static patterns.",
     "maps_to_check": "dataExposure/sensitiveDataAI",
-    "requires_ai_probe": false
+    "requires_ai_probe": false,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "DATA-03",
@@ -85,7 +115,10 @@
     "severity": "Medium",
     "test_name": "Verify that responses do not return excessive data fields beyond what the client requested.",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "MISC-01",
@@ -93,7 +126,10 @@
     "severity": "Medium",
     "test_name": "Audit CORS policy for wildcard origins or reflected origins with credentials enabled.",
     "maps_to_check": "misconfigurations/cors",
-    "requires_ai_probe": false
+    "requires_ai_probe": false,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "MISC-02",
@@ -101,7 +137,10 @@
     "severity": "Low",
     "test_name": "Verify presence and correct configuration of HTTP security headers (HSTS, CSP, X-Frame-Options).",
     "maps_to_check": "misconfigurations/securityHeaders",
-    "requires_ai_probe": false
+    "requires_ai_probe": false,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "ERR-01",
@@ -109,7 +148,10 @@
     "severity": "Medium",
     "test_name": "Send malformed requests to trigger application errors and check for stack trace or path disclosure.",
     "maps_to_check": "errorHandling/stackTrace",
-    "requires_ai_probe": false
+    "requires_ai_probe": false,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "RATE-01",
@@ -117,7 +159,10 @@
     "severity": "Medium",
     "test_name": "Send a burst of parallel requests to verify the API enforces rate limiting (429 Too Many Requests).",
     "maps_to_check": "rateLimiting/bruteForce",
-    "requires_ai_probe": false
+    "requires_ai_probe": false,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "RATE-02",
@@ -125,7 +170,10 @@
     "severity": "Medium",
     "test_name": "Verify that rate limiting applies per-user and cannot be bypassed by rotating IP headers (X-Forwarded-For).",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "MASSASSIGN-01",
@@ -133,7 +181,10 @@
     "severity": "High",
     "test_name": "Test for mass assignment vulnerabilities by sending unexpected or privileged parameters in request bodies.",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "MASSASSIGN-02",
@@ -141,7 +192,10 @@
     "severity": "High",
     "test_name": "Verify that write operations reject or ignore unexpected fields not in the API schema.",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "BIZLOGIC-01",
@@ -149,7 +203,10 @@
     "severity": "Medium",
     "test_name": "Test for transaction limit bypass — attempt to exceed defined thresholds through repeated or split operations.",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "BIZLOGIC-02",
@@ -157,7 +214,10 @@
     "severity": "Medium",
     "test_name": "Verify workflow integrity — test that multi-step processes cannot be interrupted or skipped.",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "BIZLOGIC-03",
@@ -165,7 +225,10 @@
     "severity": "Medium",
     "test_name": "Test for negative value or boundary manipulation in numeric inputs (quantities, prices, scores).",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "WS-01",
@@ -173,7 +236,10 @@
     "severity": "High",
     "test_name": "Verify WebSocket handshake enforces authentication (token in header or subprotocol).",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "websocket"
+    ]
   },
   {
     "id": "WS-02",
@@ -181,7 +247,10 @@
     "severity": "Medium",
     "test_name": "Test WebSocket messages for injection vulnerabilities and verify message-level authorization.",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "websocket"
+    ]
   },
   {
     "id": "3P-01",
@@ -189,7 +258,10 @@
     "severity": "Medium",
     "test_name": "Verify that third-party webhook endpoints validate incoming payloads using signatures or secrets.",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "3P-02",
@@ -197,7 +269,10 @@
     "severity": "Low",
     "test_name": "Ensure that error responses from third-party integrations do not leak upstream system details.",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "CICD-01",
@@ -205,7 +280,10 @@
     "severity": "High",
     "test_name": "Verify that API keys and secrets are not present in response bodies or headers.",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "rest"
+    ]
   },
   {
     "id": "CICD-02",
@@ -213,6 +291,86 @@
     "severity": "Medium",
     "test_name": "Confirm that staging/debug endpoints are not exposed in the production environment.",
     "maps_to_check": null,
-    "requires_ai_probe": true
+    "requires_ai_probe": true,
+    "applies_to": [
+      "rest"
+    ]
+  },
+  {
+    "id": "GQL-01",
+    "category": "GraphQL Security",
+    "severity": "Medium",
+    "test_name": "Verify GraphQL introspection is disabled or restricted in production.",
+    "maps_to_check": "graphql/introspectionEnabled",
+    "requires_ai_probe": false,
+    "applies_to": [
+      "graphql"
+    ]
+  },
+  {
+    "id": "GQL-02",
+    "category": "GraphQL Security",
+    "severity": "High",
+    "test_name": "Verify the server enforces query depth/complexity limits to prevent resource-exhaustion DoS.",
+    "maps_to_check": "graphql/queryDepth",
+    "requires_ai_probe": false,
+    "applies_to": [
+      "graphql"
+    ]
+  },
+  {
+    "id": "GQL-03",
+    "category": "GraphQL Security",
+    "severity": "Critical",
+    "test_name": "Test for broken field-level authorization — request nested fields/objects a role should not be able to access via a single query.",
+    "maps_to_check": null,
+    "requires_ai_probe": true,
+    "applies_to": [
+      "graphql"
+    ]
+  },
+  {
+    "id": "GRPC-01",
+    "category": "gRPC Security",
+    "severity": "Critical",
+    "test_name": "Verify gRPC methods reject calls missing authentication metadata.",
+    "maps_to_check": "grpc/metadataAuthStripping",
+    "requires_ai_probe": false,
+    "applies_to": [
+      "grpc"
+    ]
+  },
+  {
+    "id": "GRPC-02",
+    "category": "gRPC Security",
+    "severity": "Medium",
+    "test_name": "Verify server reflection is disabled in production.",
+    "maps_to_check": "grpc/reflectionEnabled",
+    "requires_ai_probe": false,
+    "applies_to": [
+      "grpc"
+    ]
+  },
+  {
+    "id": "GRPC-03",
+    "category": "gRPC Security",
+    "severity": "High",
+    "test_name": "Verify the server rejects plaintext (insecure) channel connections and enforces TLS.",
+    "maps_to_check": "grpc/tlsEnforcement",
+    "requires_ai_probe": false,
+    "applies_to": [
+      "grpc"
+    ]
+  },
+  {
+    "id": "GRPC-04",
+    "category": "gRPC Security",
+    "severity": "Medium",
+    "test_name": "Verify the server enforces message/metadata size limits to prevent resource-exhaustion DoS.",
+    "maps_to_check": "grpc/messageSizeLimits",
+    "requires_ai_probe": false,
+    "applies_to": [
+      "grpc"
+    ]
   }
 ]

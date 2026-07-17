@@ -4,10 +4,9 @@
  * Maps a raw probe result (HTTP response + probe spec) to the FALCON checklist
  * verdict vocabulary: PASS | FAILED | N/A | TO BE CONFIRMED.
  *
- * The classifier reuses the same confidence guardrail already present in
- * engine.js for sensitiveDataAI — except here it maps uncertain verdicts to
- * "TO BE CONFIRMED" rather than "MANUAL", consistent with the source checklist's
- * own vocabulary for uncertain CI/CD items.
+ * Uses the centralised cerebrasClient for all AI calls so retry logic,
+ * InfrastructureError propagation, and rate-limit handling are consistent
+ * across all three AI pipeline stages.
  *
  * Hardcoded (rule-based) checks bypass this module entirely.  It is only called
  * for check results that originated from an AI-synthesized probe.
@@ -22,12 +21,9 @@
  * }
  */
 
-const axios = require('axios');
 const logger = require('../../utils/logger');
+const { callCerebras } = require('../cerebrasClient');
 const { AI_CONFIDENCE_THRESHOLD, AI_FAIL_CONFIDENCE_THRESHOLD } = require('../../config/aiConfig');
-
-const CEREBRAS_URL = 'https://api.cerebras.ai/v1/chat/completions';
-const MODEL = 'gpt-oss-120b';
 
 const SYSTEM_PROMPT = `You are a security verdict classifier for an API security scanner.
 You will receive:
@@ -64,20 +60,9 @@ function sanitizeData(data) {
  * @param {object} probeSpec    - the spec that was executed (from probeSynthesizer)
  * @param {object} httpResponse - { status, headers, data } from axios
  * @returns {Promise<object>}   - normalized result object for engine.js
+ * @throws {InfrastructureError} if Cerebras is unreachable after retries
  */
 async function classifyVerdict(probeSpec, httpResponse) {
-    // Fallback for missing API key
-    if (!process.env.CEREBRAS_API_KEY) {
-        logger.warn('[VerdictClassifier] CEREBRAS_API_KEY missing — returning TO BE CONFIRMED.');
-        return {
-            status: 'TO BE CONFIRMED',
-            message: 'Missing Cerebras API key — manual review required.',
-            ai_confidence: 0,
-            ai_reasoning: 'API key unavailable.',
-            evidence_cited: [],
-        };
-    }
-
     const safeBody = sanitizeData(
         typeof httpResponse.data === 'string'
             ? httpResponse.data.slice(0, 6000)
@@ -85,7 +70,7 @@ async function classifyVerdict(probeSpec, httpResponse) {
     );
     const safeHeaders = sanitizeData(JSON.stringify(httpResponse.headers || {}));
 
-    const evidence = {
+    const userContent = {
         probe: {
             check_id:    probeSpec.check_id,
             method:      probeSpec.method,
@@ -97,90 +82,72 @@ async function classifyVerdict(probeSpec, httpResponse) {
         response_data: `<http_response>\nStatus: ${httpResponse.status}\nHeaders: ${safeHeaders}\nBody: ${safeBody}\n</http_response>`,
     };
 
-    try {
-        const res = await axios.post(CEREBRAS_URL, {
-            model: MODEL,
-            messages: [
-                { role: 'system', content: SYSTEM_PROMPT },
-                { role: 'user',   content: JSON.stringify(evidence) },
-            ],
-            response_format: { type: 'json_object' },
-            temperature: 0,
-        }, {
-            headers: { Authorization: `Bearer ${process.env.CEREBRAS_API_KEY}` },
-            timeout: 20000,
-        });
+    // callCerebras throws InfrastructureError on retries exhausted — let it propagate
+    const parsed = await callCerebras({ systemPrompt: SYSTEM_PROMPT, userContent, temperature: 0 });
 
-        const parsed = JSON.parse(res.data.choices[0].message.content);
+    if (!parsed.verdict || parsed.confidence === undefined) {
+        throw new Error(`[VerdictClassifier] Malformed verdict response from model for ${probeSpec.check_id}`);
+    }
 
-        if (!parsed.verdict || parsed.confidence === undefined) {
-            throw new Error('Malformed verdict response from model.');
-        }
+    // -----------------------------------------------------------------------
+    // Deterministic mechanical overrides — rule-based cross-checks that
+    // override toward caution when HTTP artifacts contradict the AI's PASS.
+    // -----------------------------------------------------------------------
+    let status = parsed.verdict;
 
-        // Apply confidence guardrails — map low-confidence to TO BE CONFIRMED
-        let status = parsed.verdict;
+    if (status === 'PASS') {
+        const checkId = probeSpec.check_id || '';
+        const resStatus = httpResponse.status;
 
-        if (status === 'PASS') {
-            const checkId = probeSpec.check_id || '';
-            const resStatus = httpResponse.status;
-
-            // Auth cross-check
-            if (checkId.startsWith('AUTH-') && resStatus !== 401 && resStatus !== 403) {
-                logger.warn(`[VerdictClassifier] Deterministic override: ${checkId} AI returned PASS but status was ${resStatus} (expected 401/403).`);
-                status = 'TO BE CONFIRMED';
-            }
-            // Rate Limiting cross-check
-            if (checkId.startsWith('RATE-') && resStatus !== 429) {
-                logger.warn(`[VerdictClassifier] Deterministic override: ${checkId} AI returned PASS but status was ${resStatus} (expected 429).`);
-                status = 'TO BE CONFIRMED';
-            }
-            // CORS cross-check
-            const acao = (httpResponse.headers && httpResponse.headers['access-control-allow-origin']) || '';
-            const acac = (httpResponse.headers && httpResponse.headers['access-control-allow-credentials']) || '';
-            if (acao === '*' && String(acac).toLowerCase() === 'true') {
-                logger.warn(`[VerdictClassifier] Deterministic override: CORS wildcard with credentials detected.`);
-                status = 'TO BE CONFIRMED';
-            }
-            // Regex Data Exposure cross-check
-            if (checkId.startsWith('DATA-')) {
-                const hasSSN = /\\b\\d{3}-\\d{2}-\\d{4}\\b/.test(safeBody);
-                const hasJWT = /eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}/.test(safeBody);
-                if (hasSSN || hasJWT) {
-                    logger.warn(`[VerdictClassifier] Deterministic override: ${checkId} regex detected sensitive data (JWT/SSN).`);
-                    status = 'TO BE CONFIRMED';
-                }
-            }
-        }
-
-        const isFail = status === 'FAILED';
-        const threshold = isFail ? AI_FAIL_CONFIDENCE_THRESHOLD : AI_CONFIDENCE_THRESHOLD;
-
-        if (parsed.confidence < threshold) {
-            logger.warn(
-                `[VerdictClassifier] Confidence ${parsed.confidence.toFixed(2)} < ${threshold} ` +
-                `— downgrading ${status} → TO BE CONFIRMED`
-            );
+        // Auth cross-check
+        if (checkId.startsWith('AUTH-') && resStatus !== 401 && resStatus !== 403) {
+            logger.warn(`[VerdictClassifier] Deterministic override: ${checkId} AI returned PASS but status was ${resStatus} (expected 401/403).`);
             status = 'TO BE CONFIRMED';
         }
-
-        return {
-            status,
-            message:        parsed.message,
-            ai_confidence:  parsed.confidence,
-            ai_reasoning:   parsed.ai_reasoning,
-            evidence_cited: parsed.evidence_cited || [],
-        };
-
-    } catch (err) {
-        logger.warn(`[VerdictClassifier] Classification failed: ${err.message} — returning TO BE CONFIRMED.`);
-        return {
-            status: 'TO BE CONFIRMED',
-            message: `Verdict classification failed: ${err.message}`,
-            ai_confidence: 0,
-            ai_reasoning:  err.message,
-            evidence_cited: [],
-        };
+        // Rate Limiting cross-check
+        if (checkId.startsWith('RATE-') && resStatus !== 429) {
+            logger.warn(`[VerdictClassifier] Deterministic override: ${checkId} AI returned PASS but status was ${resStatus} (expected 429).`);
+            status = 'TO BE CONFIRMED';
+        }
+        // CORS cross-check
+        const acao = (httpResponse.headers && httpResponse.headers['access-control-allow-origin']) || '';
+        const acac = (httpResponse.headers && httpResponse.headers['access-control-allow-credentials']) || '';
+        if (acao === '*' && String(acac).toLowerCase() === 'true') {
+            logger.warn(`[VerdictClassifier] Deterministic override: CORS wildcard with credentials detected.`);
+            status = 'TO BE CONFIRMED';
+        }
+        // Regex Data Exposure cross-check
+        if (checkId.startsWith('DATA-')) {
+            const hasSSN = /\b\d{3}-\d{2}-\d{4}\b/.test(safeBody);
+            const hasJWT = /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/.test(safeBody);
+            if (hasSSN || hasJWT) {
+                logger.warn(`[VerdictClassifier] Deterministic override: ${checkId} regex detected sensitive data (JWT/SSN).`);
+                status = 'TO BE CONFIRMED';
+            }
+        }
     }
+
+    // -----------------------------------------------------------------------
+    // Confidence guardrail — low-confidence AI verdicts downgrade to TBC
+    // -----------------------------------------------------------------------
+    const isFail = status === 'FAILED';
+    const threshold = isFail ? AI_FAIL_CONFIDENCE_THRESHOLD : AI_CONFIDENCE_THRESHOLD;
+
+    if (parsed.confidence < threshold) {
+        logger.warn(
+            `[VerdictClassifier] Confidence ${parsed.confidence.toFixed(2)} < ${threshold} ` +
+            `— downgrading ${status} → TO BE CONFIRMED`
+        );
+        status = 'TO BE CONFIRMED';
+    }
+
+    return {
+        status,
+        message:        parsed.message,
+        ai_confidence:  parsed.confidence,
+        ai_reasoning:   parsed.ai_reasoning,
+        evidence_cited: parsed.evidence_cited || [],
+    };
 }
 
 module.exports = { classifyVerdict };

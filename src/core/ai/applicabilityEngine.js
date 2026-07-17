@@ -4,8 +4,12 @@
  * For a given endpoint, asks Cerebras which checklist items are actually
  * applicable vs. N/A — so we skip WebSocket checks on a REST GET, etc.
  *
- * Result is cached in-memory by endpoint signature (METHOD /path) so
- * re-scanning the same endpoint in one session does not re-call the model.
+ * Applicability decisions are expensive — one batched LLM call per endpoint.
+ * Results are cached via the injected AICache instance (persistent-cache) and
+ * an in-process Map (session-level) so the same endpoint is never evaluated twice.
+ *
+ * Throws InfrastructureError if the Cerebras API is unreachable after retries,
+ * which aborts the scan rather than silently applying all items.
  *
  * Output contract (strict JSON from the model):
  * {
@@ -15,16 +19,12 @@
  * }
  */
 
-const axios = require('axios');
 const logger = require('../../utils/logger');
+const { callCerebras } = require('../cerebrasClient');
 
-const CEREBRAS_URL = 'https://api.cerebras.ai/v1/chat/completions';
-const MODEL = 'gpt-oss-120b';  // Production-tier model (pinned per aiConfig guidance)
+// In-memory session cache — keyed by "METHOD /path"
+const _sessionCache = new Map();
 
-// In-memory cache — keyed by "METHOD /path"
-const _cache = new Map();
-
-// Build the system prompt once
 const SYSTEM_PROMPT = `You are a security testing assistant for an API security scanner.
 You will be given:
 1. An API endpoint description (method, path, optional schema hints) wrapped in <endpoint_context> tags.
@@ -51,71 +51,60 @@ Respond ONLY with valid JSON matching this exact schema — no explanation, no m
 /**
  * Determine applicable checklist item IDs for a single endpoint.
  *
- * @param {object} endpoint - { path: string, methods: string[] }
+ * @param {object} endpoint  - { path: string, methods: string[] }
  * @param {Array}  checklist - the full checklist array from checklist.json
+ * @param {AICache|null} cache - optional persistent cache instance
  * @returns {Promise<{applicable_ids: string[], na_ids: string[]}>}
+ * @throws {InfrastructureError} if Cerebras is unreachable after retries
  */
-async function getApplicableItems(endpoint, checklist) {
+async function getApplicableItems(endpoint, checklist, cache = null) {
     const method = (endpoint.methods && endpoint.methods[0]) || 'GET';
-    const cacheKey = `${method.toUpperCase()} ${endpoint.path}`;
+    const sessionKey = `${method.toUpperCase()} ${endpoint.path}`;
 
-    if (_cache.has(cacheKey)) {
-        logger.info(`[ApplicabilityEngine] Cache hit for ${cacheKey}`);
-        return _cache.get(cacheKey);
+    // 1. Session-level cache (same endpoint scanned twice in one run)
+    if (_sessionCache.has(sessionKey)) {
+        logger.info(`[ApplicabilityEngine] Session cache hit for ${sessionKey}`);
+        return _sessionCache.get(sessionKey);
     }
 
-    if (!process.env.CEREBRAS_API_KEY) {
-        logger.warn('[ApplicabilityEngine] CEREBRAS_API_KEY missing — marking all items applicable.');
-        const allIds = checklist.map(i => i.id);
-        return { applicable_ids: allIds, na_ids: [] };
+    // 2. Persistent cache (from committed cache file)
+    if (cache) {
+        const cached = cache.getApplicability(endpoint);
+        if (cached) {
+            logger.info(`[ApplicabilityEngine] Persistent cache hit for ${sessionKey}`);
+            _sessionCache.set(sessionKey, cached);
+            return cached;
+        }
     }
 
-    // Summarise the checklist for the prompt (id + category only — keeps tokens low)
     const checklistSummary = checklist.map(i => ({ id: i.id, category: i.category, test_name: i.test_name }));
 
-    const userMessage = JSON.stringify({
+    const userContent = {
         endpoint_context: `<endpoint_context>\n${JSON.stringify({
-            endpoint: cacheKey,
+            endpoint: sessionKey,
             method,
             path: endpoint.path,
         })}\n</endpoint_context>`,
         checklist_items: checklistSummary,
-    });
+    };
 
-    try {
-        const res = await axios.post(CEREBRAS_URL, {
-            model: MODEL,
-            messages: [
-                { role: 'system', content: SYSTEM_PROMPT },
-                { role: 'user',   content: userMessage },
-            ],
-            response_format: { type: 'json_object' },
-            temperature: 0,
-        }, {
-            headers: { Authorization: `Bearer ${process.env.CEREBRAS_API_KEY}` },
-            timeout: 20000,
-        });
+    // callCerebras throws InfrastructureError on retries exhausted — let it propagate
+    const parsed = await callCerebras({ systemPrompt: SYSTEM_PROMPT, userContent, temperature: 0 });
 
-        const parsed = JSON.parse(res.data.choices[0].message.content);
-
-        if (!Array.isArray(parsed.applicable_ids) || !Array.isArray(parsed.na_ids)) {
-            throw new Error('Model returned malformed applicability response.');
-        }
-
-        logger.info(
-            `[ApplicabilityEngine] ${cacheKey}: ` +
-            `${parsed.applicable_ids.length} applicable, ${parsed.na_ids.length} N/A`
-        );
-
-        _cache.set(cacheKey, parsed);
-        return parsed;
-
-    } catch (err) {
-        logger.warn(`[ApplicabilityEngine] AI call failed for ${cacheKey}: ${err.message} — applying all items.`);
-        // Safe fallback: treat all items as applicable rather than silently skipping checks
-        const allIds = checklist.map(i => i.id);
-        return { applicable_ids: allIds, na_ids: [] };
+    if (!Array.isArray(parsed.applicable_ids) || !Array.isArray(parsed.na_ids)) {
+        throw new Error(`[ApplicabilityEngine] Malformed applicability response for ${sessionKey}`);
     }
+
+    logger.info(
+        `[ApplicabilityEngine] ${sessionKey}: ` +
+        `${parsed.applicable_ids.length} applicable, ${parsed.na_ids.length} N/A`
+    );
+
+    // Store in both caches
+    _sessionCache.set(sessionKey, parsed);
+    if (cache) cache.setApplicability(endpoint, parsed);
+
+    return parsed;
 }
 
 module.exports = { getApplicableItems };

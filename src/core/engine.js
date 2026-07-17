@@ -1,7 +1,8 @@
 const logger = require('../utils/logger');
 const Context = require('./context');
-const { createClient } = require('../utils/httpClient');
+const adapters = require('../adapters');
 const { AI_CONFIDENCE_THRESHOLD, AI_FAIL_CONFIDENCE_THRESHOLD } = require('../config/aiConfig');
+const { InfrastructureError } = require('../utils/errors');
 
 // ---------------------------------------------------------------------------
 // Checklist-driven AI layer
@@ -33,16 +34,47 @@ const checksRegistry = {
     'rateLimiting/bruteForce':       require('../checks/rateLimiting/bruteForce'),
     'injection/sqliXss':             require('../checks/injection/sqliXss'),
     'injection/pathTraversal':       require('../checks/injection/pathTraversal'),
+    'graphql/introspectionEnabled': require('../checks/graphql/introspectionEnabled'),
+    'graphql/queryDepth':            require('../checks/graphql/queryDepth'),
+    'grpc/metadataAuthStripping':    require('../checks/grpc/metadataAuthStripping'),
+    'grpc/reflectionEnabled':        require('../checks/grpc/reflectionEnabled'),
+    'grpc/tlsEnforcement':           require('../checks/grpc/tlsEnforcement'),
+    'grpc/messageSizeLimits':        require('../checks/grpc/messageSizeLimits'),
+};
+
+// Which protocols a *legacy* (non-checklist) hardcoded check is meaningful against.
+// GraphQL/REST both speak plain HTTP so generic checks (auth stripping, CORS, injection, etc.)
+// still produce meaningful results against GraphQL — verified in practice. gRPC does not: its
+// client facade ignores the HTTP-semantic `method` field entirely (there's no OPTIONS/TRACE/etc.
+// in gRPC), so those same generic checks silently invoke the endpoint's one RPC regardless of
+// what method they think they're testing and report bogus results. Protocol-specific checks
+// (graphql/*, grpc/*) are restricted to their own protocol.
+const legacyCheckAppliesTo = (checkName, protocol) => {
+    const targetProtocol = protocol || 'rest';
+    if (checkName.startsWith('graphql/')) return targetProtocol === 'graphql';
+    if (checkName.startsWith('grpc/')) return targetProtocol === 'grpc';
+    return targetProtocol === 'rest' || targetProtocol === 'graphql';
 };
 
 class Engine {
     constructor(config) {
         this.context = new Context(config);
-        this.client  = createClient(config.base_url, this.context.getAuthHeaders(), 5000, this.context);
+        const adapter = adapters[config.protocol || 'rest'];
+        if (!adapter) throw new Error(`Unknown protocol "${config.protocol}" — no adapter registered.`);
+        this.client  = adapter.createClient(config, this.context);
         // Legacy: flat list of hardcoded checks loaded via loadChecks()
         this.checks  = [];
         // Checklist-driven mode flag — enabled by loadChecklist()
         this._checklistMode = false;
+        // Optional persistent AI cache (AICache instance), set by setCache()
+        this._cache = null;
+    }
+
+    // -------------------------------------------------------------------------
+    // Attach a persistent AI cache (optional — called by CLI if --cache is set)
+    // -------------------------------------------------------------------------
+    setCache(cacheInstance) {
+        this._cache = cacheInstance;
     }
 
     // -------------------------------------------------------------------------
@@ -91,6 +123,8 @@ class Engine {
             ai_confidence: result.ai_confidence,
             ai_reasoning:  result.ai_reasoning,
             evidence_cited: result.evidence_cited,
+            // Evidence trail — populated by _runAiProbe, null for hardcoded checks
+            evidence_trail: result.evidence_trail || null,
         };
     }
 
@@ -136,8 +170,8 @@ class Engine {
     async _runAiProbe(checklistItem, endpoint) {
         const checkName = `checklist/${checklistItem.id}`;
 
-        // 1. Synthesize probe spec
-        const probeSpec = await synthesizeProbe(checklistItem, endpoint);
+        // 1. Synthesize probe spec (cache-aware, throws InfrastructureError if AI unreachable)
+        const probeSpec = await synthesizeProbe(checklistItem, endpoint, this._cache);
 
         if (!probeSpec) {
             // Synthesizer returned null — incompatible combo, emit N/A
@@ -168,11 +202,32 @@ class Engine {
             return;
         }
 
-        // 3. Classify verdict
+        // 3. Classify verdict (throws InfrastructureError if AI unreachable)
         const verdict = await classifyVerdict(probeSpec, httpResponse);
-        const normalized = this._normalizeResult(checkName, endpoint, verdict);
-        // Guardrail already applied inside verdictClassifier, but run again
-        // centrally to keep the policy in one place.
+        const normalized = this._normalizeResult(checkName, endpoint, {
+            ...verdict,
+            // Attach full evidence trail for triageability
+            evidence_trail: {
+                request: {
+                    method:      probeSpec.method,
+                    path:        probeSpec.path,
+                    headers:     probeSpec.headers || {},
+                    body:        probeSpec.body || null,
+                    query_params: probeSpec.query_params || null,
+                    expectation: probeSpec.expectation,
+                },
+                response: {
+                    status:  httpResponse.status,
+                    headers: httpResponse.headers,
+                    // Truncate body to 2000 chars — enough for triage, not a data dump
+                    body:    typeof httpResponse.data === 'string'
+                        ? httpResponse.data.substring(0, 2000)
+                        : JSON.stringify(httpResponse.data).substring(0, 2000),
+                },
+                ai_reasoning:  verdict.ai_reasoning,
+                evidence_cited: verdict.evidence_cited,
+            },
+        });
         this._applyGuardrail(normalized, checkName);
         this.context.addResult(normalized);
         this._logResult(normalized);
@@ -209,11 +264,29 @@ class Engine {
             // CHECKLIST MODE — driven by checklist.json + AI applicability
             // ---------------------------------------------------------------
             if (this._checklistMode) {
+                const endpointProtocol = endpoint.protocol || 'rest';
+
+                // 0. Cheaply exclude items tagged for a different protocol before spending
+                // an AI call on applicability — e.g. GraphQL-only items on a REST endpoint.
+                const protocolRelevantItems = checklist.filter(
+                    item => !item.applies_to || item.applies_to.includes(endpointProtocol)
+                );
+                for (const item of checklist) {
+                    if (item.applies_to && !item.applies_to.includes(endpointProtocol)) {
+                        this.context.addResult(this._normalizeResult(
+                            `checklist/${item.id}`, endpoint, {
+                                status:  'N/A',
+                                message: `Not applicable to protocol "${endpointProtocol}".`,
+                            }
+                        ));
+                    }
+                }
+
                 // 1. Ask the applicability engine which items apply to this endpoint
-                const applicability = await getApplicableItems(endpoint, checklist);
+                const applicability = await getApplicableItems(endpoint, protocolRelevantItems);
                 const applicableSet = new Set(applicability.applicable_ids);
 
-                for (const item of checklist) {
+                for (const item of protocolRelevantItems) {
                     if (!applicableSet.has(item.id)) {
                         // Emit N/A for excluded items so the report is complete
                         this.context.addResult(this._normalizeResult(
@@ -239,6 +312,8 @@ class Engine {
                             logger.warn(`[Engine] Checklist item ${item.id} has no handler — skipping.`);
                         }
                     } catch (err) {
+                        // Re-throw infrastructure errors to abort the scan immediately
+                        if (err.name === 'InfrastructureError') throw err;
                         logger.error(`[Engine] Error processing ${item.id} on ${endpoint.path}: ${err.message}`);
                     }
                 }
@@ -248,6 +323,7 @@ class Engine {
             // ---------------------------------------------------------------
             } else {
                 for (const check of this.checks) {
+                    if (!legacyCheckAppliesTo(check.name, endpoint.protocol)) continue;
                     try {
                         const result = await check.run(this.context, this.client, endpoint);
 
@@ -265,6 +341,10 @@ class Engine {
         }
 
         logger.title('\nScan Complete.');
+
+        // Persist cache if it was used
+        if (this._cache) this._cache.save();
+
         return this.context.getResults();
     }
 }

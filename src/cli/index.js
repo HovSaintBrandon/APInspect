@@ -12,6 +12,7 @@ const staticAnalyzer = require('../core/staticAnalyzer');
 const newmanRunner = require('../core/newmanRunner');
 const logger = require('../utils/logger');
 const packageJson = require('../../package.json');
+const { InfrastructureError } = require('../utils/errors');
 
 const program = new Command();
 
@@ -54,17 +55,24 @@ program
 
 program
     .command('scan <file>')
-    .description('Scan an API definition file (JSON)')
+    .description(
+        'Scan an API definition: Postman collection or internal JSON, OpenAPI/Swagger (.json/.yaml/.yml), ' +
+        'GraphQL SDL (.graphql/.gql) or a live GraphQL URL for introspection, or a gRPC .proto file'
+    )
     .option('-t, --token <token>', 'Bearer token for authentication')
     .option('-u, --username <user>', 'Username for Basic Auth')
     .option('-p, --password <pass>', 'Password for Basic Auth')
-    .option('-b, --base-url <url>', 'Base URL to use for the scan')
+    .option('-b, --base-url <url>', 'Base URL for REST/GraphQL specs, or "host:port" target for a gRPC .proto file')
     .option('--auth-file <path>', 'Path to JSON file containing role:token mapping or login_endpoint config')
     .option('-o, --output <path>', 'Path to save report (.json, .csv, or .falcon.csv)')
     .option('--checklist', 'Run in checklist-driven mode using src/config/checklist.json + AI layer')
+    .option('--cache <path>', 'Path to AI decision cache file. Generates on first run; CI reads from committed file.')
     .option('--fail-on <severity>', 'Fail with exit code 1 if any confirmed finding meets or exceeds this severity (critical, high, medium, low, info)')
     .option('--fail-on-tbc', 'Also fail on TO BE CONFIRMED findings that meet --fail-on severity (requires --fail-on)')
     .action(async (file, options) => {
+        // Declared outside the try block so the catch handler can still report
+        // partial results if an error is thrown mid-scan (see InfrastructureError handling below).
+        const allResults = [];
         try {
             logger.title('Initializing APInspect...');
 
@@ -80,11 +88,15 @@ program
             }
             const failOnThreshold = options.failOn ? options.failOn.toLowerCase() : null;
 
-            // Collect all results across roles for exit-code evaluation
-            const allResults = [];
-
             // 1. Parse Input
             const config = await parse(file, options.baseUrl);
+
+            // 2. Initialise AI cache (if --cache is set)
+            let aiCache = null;
+            if (options.cache) {
+                const AICache = require('../core/ai/cache');
+                aiCache = new AICache(options.cache);
+            }
 
             // 2. Auth handling
             let authMap = {};
@@ -118,10 +130,14 @@ program
                                 authMap[role.name] = { type: 'bearer', token };
                                 logger.info(`✅ Successfully fetched token for role: ${role.name}`);
                             } else {
-                                logger.error(`❌ Token path '${authConfig.token_path}' not found in response for ${role.name}`);
+                                throw new InfrastructureError(
+                                    `Token path '${authConfig.token_path}' not found in response for role '${role.name}'. ` +
+                                    `Cannot proceed — scan without authentication would manufacture false confidence.`
+                                );
                             }
                         } catch (err) {
-                            logger.error(`❌ Failed to fetch token for role ${role.name}: ${err.message}`);
+                            if (err.name === 'InfrastructureError') throw err;
+                            throw new InfrastructureError(`Failed to fetch token for role '${role.name}': ${err.message}`);
                         }
                     }
                 } else if (Array.isArray(authConfig.roles)) {
@@ -164,10 +180,14 @@ program
                                     authMap[role.name] = { type: 'bearer', token };
                                     logger.info(`✅ Fetched Bearer token for role: ${role.name}`);
                                 } else {
-                                    logger.error(`❌ token_path '${role.token_path}' not found in response for ${role.name}`);
+                                    throw new InfrastructureError(
+                                        `token_path '${role.token_path}' not found in response for role '${role.name}'. ` +
+                                        `Cannot proceed — scan without authentication would manufacture false confidence.`
+                                    );
                                 }
                             } catch (err) {
-                                logger.error(`❌ Failed to fetch token for role ${role.name}: ${err.message}`);
+                                if (err.name === 'InfrastructureError') throw err;
+                                throw new InfrastructureError(`Failed to fetch token for role '${role.name}': ${err.message}`);
                             }
                         } else {
                             logger.warn(`⚠ Unknown auth_type '${role.auth_type}' for role ${role.name} — skipping.`);
@@ -201,6 +221,9 @@ program
 
                 // 3. Initialize Engine
                 const engine = new Engine(config);
+
+                // Wire in the AI cache if available
+                if (aiCache) engine.setCache(aiCache);
 
                 if (options.checklist) {
                     // Checklist-driven mode: FALCON checklist + AI applicability/synthesis/classification
@@ -297,6 +320,20 @@ program
             }
 
         } catch (err) {
+            if (err.name === 'InfrastructureError') {
+                // Infrastructure failure — not a security finding.
+                // Dump partial results so the run isn't a total loss, then abort.
+                logger.error(`\n✖ [ABORTED] Infrastructure failure: ${err.message}`);
+                logger.error('  The scan was aborted. Partial results below are INCOMPLETE — do not use for gating.');
+                if (allResults.length > 0) {
+                    const partialPath = options.output
+                        ? options.output.replace(/(\.[^.]+)?$/, '.partial$1')
+                        : require('path').join(process.cwd(), 'reports', 'partial-report.json');
+                    jsonReporter.generate(allResults, partialPath);
+                    logger.warn(`  Partial results saved to: ${partialPath}`);
+                }
+                process.exit(3); // 3 = Infrastructure/Network Failure
+            }
             logger.error(`Scan failed: ${err.message}`);
             process.exit(1);
         }

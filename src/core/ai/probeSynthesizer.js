@@ -8,26 +8,27 @@
  * execution happens in engine.js via the shared httpClient, keeping the
  * request-sending path singular and auditable.
  *
- * Probe spec contract (returned from this module):
- * {
- *   "check_id":        "MASSASSIGN-01",
- *   "method":          "PATCH",
- *   "path":            "/api/users/1",
- *   "headers":         { "Content-Type": "application/json" },       // optional
- *   "body":            { "role": "admin", "isVerified": true },       // optional
- *   "query_params":    { "debug": "true" },                          // optional
- *   "expectation":     "injected fields must not appear in response" // for verdict classifier
- * }
+ * Probe specs are cached via the injected AICache instance so CI runs are
+ * deterministic. Probes run at temperature 0.1 in non-cached mode to give
+ * fuzzing-like variance.
  *
- * If the model cannot generate a meaningful probe (ambiguous endpoint, no
- * schema available), it returns null and the check is skipped as N/A.
+ * Throws InfrastructureError if the Cerebras API is unreachable after retries,
+ * which aborts the scan rather than silently emitting N/A.
+ *
+ * Probe spec contract:
+ * {
+ *   "check_id":     "MASSASSIGN-01",
+ *   "method":       "PATCH",
+ *   "path":         "/api/users/1",
+ *   "headers":      { "Content-Type": "application/json" },
+ *   "body":         { "role": "admin", "isVerified": true },
+ *   "query_params": { "debug": "true" },
+ *   "expectation":  "injected fields must not appear in response"
+ * }
  */
 
-const axios = require('axios');
 const logger = require('../../utils/logger');
-
-const CEREBRAS_URL = 'https://api.cerebras.ai/v1/chat/completions';
-const MODEL = 'gpt-oss-120b';
+const { callCerebras } = require('../cerebrasClient');
 
 const SYSTEM_PROMPT = `You are a security testing assistant for an API security scanner.
 You will be given:
@@ -54,17 +55,23 @@ Respond ONLY with valid JSON matching ONE of these exact shapes:
  *
  * @param {object} checklistItem - { id, category, test_name, requires_ai_probe }
  * @param {object} endpoint      - { path, methods, originalName? }
+ * @param {AICache|null} cache   - optional persistent cache instance
  * @returns {Promise<object|null>} probe spec or null if incompatible
+ * @throws {InfrastructureError} if Cerebras is unreachable after retries
  */
-async function synthesizeProbe(checklistItem, endpoint) {
+async function synthesizeProbe(checklistItem, endpoint, cache = null) {
     const method = (endpoint.methods && endpoint.methods[0]) || 'GET';
 
-    if (!process.env.CEREBRAS_API_KEY) {
-        logger.warn(`[ProbeSynthesizer] CEREBRAS_API_KEY missing — skipping synthesis for ${checklistItem.id}`);
-        return null;
+    // Check persistent cache first
+    if (cache) {
+        const cached = cache.getProbe(endpoint, checklistItem.id);
+        if (cached !== null) {
+            logger.info(`[ProbeSynthesizer] Cache hit for ${checklistItem.id} on ${method} ${endpoint.path}`);
+            return cached; // may be a probe spec object or the sentinel { __null: true }
+        }
     }
 
-    const userMessage = JSON.stringify({
+    const userContent = {
         checklist_item: {
             id: checklistItem.id,
             category: checklistItem.category,
@@ -75,40 +82,29 @@ async function synthesizeProbe(checklistItem, endpoint) {
             path: endpoint.path,
             name: endpoint.originalName || null,
         })}\n</endpoint_context>`,
+    };
+
+    // callCerebras throws InfrastructureError on retries exhausted — let it propagate
+    const parsed = await callCerebras({
+        systemPrompt: SYSTEM_PROMPT,
+        userContent,
+        temperature: cache ? 0 : 0.1, // Deterministic when using cache, slightly varied otherwise
     });
 
-    try {
-        const res = await axios.post(CEREBRAS_URL, {
-            model: MODEL,
-            messages: [
-                { role: 'system', content: SYSTEM_PROMPT },
-                { role: 'user',   content: userMessage },
-            ],
-            response_format: { type: 'json_object' },
-            temperature: 0.1, // Slight variation so probes aren't always identical
-        }, {
-            headers: { Authorization: `Bearer ${process.env.CEREBRAS_API_KEY}` },
-            timeout: 20000,
-        });
-
-        const parsed = JSON.parse(res.data.choices[0].message.content);
-
-        if (parsed.probe === null) {
-            logger.info(`[ProbeSynthesizer] ${checklistItem.id} on ${method} ${endpoint.path}: N/A — ${parsed.reason}`);
-            return null;
-        }
-
-        if (!parsed.probe || !parsed.probe.method || !parsed.probe.path) {
-            throw new Error('Malformed probe spec returned by model.');
-        }
-
-        logger.info(`[ProbeSynthesizer] Synthesized probe: ${parsed.probe.method} ${parsed.probe.path} for ${checklistItem.id}`);
-        return parsed.probe;
-
-    } catch (err) {
-        logger.warn(`[ProbeSynthesizer] Synthesis failed for ${checklistItem.id}: ${err.message} — skipping.`);
+    if (parsed.probe === null) {
+        logger.info(`[ProbeSynthesizer] ${checklistItem.id} on ${method} ${endpoint.path}: N/A — ${parsed.reason}`);
+        if (cache) cache.setProbe(endpoint, checklistItem.id, null); // cache the N/A decision
         return null;
     }
+
+    if (!parsed.probe || !parsed.probe.method || !parsed.probe.path) {
+        throw new Error(`[ProbeSynthesizer] Malformed probe spec from model for ${checklistItem.id}`);
+    }
+
+    logger.info(`[ProbeSynthesizer] Synthesized probe: ${parsed.probe.method} ${parsed.probe.path} for ${checklistItem.id}`);
+
+    if (cache) cache.setProbe(endpoint, checklistItem.id, parsed.probe);
+    return parsed.probe;
 }
 
 module.exports = { synthesizeProbe };

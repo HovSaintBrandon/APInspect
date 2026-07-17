@@ -31,6 +31,11 @@ const generate = (results, outputPath) => {
                     ai_reasoning: r.ai_reasoning,
                     evidence_cited: r.evidence_cited,
                 }),
+                // Evidence trail: only emitted for actionable findings (FAIL, WARN, TBC)
+                // so PASS/N/A results stay compact
+                ...((r.evidence_trail && ['FAIL', 'FAILED', 'WARN', 'TO BE CONFIRMED', 'MANUAL'].includes(r.status)) && {
+                    evidence_trail: r.evidence_trail,
+                }),
             }))
         }, null, 2);
 

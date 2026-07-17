@@ -1,6 +1,9 @@
 const fs = require('fs');
 const path = require('path');
 const logger = require('../utils/logger');
+const openapiAdapter = require('../adapters/rest/openapiAdapter');
+const graphqlAdapter = require('../adapters/graphql/graphqlAdapter');
+const grpcAdapter = require('../adapters/grpc/grpcAdapter');
 
 // Simple validation schema
 const validateConfig = (config) => {
@@ -64,21 +67,83 @@ const extractPostmanEndpoints = (items, variables = []) => {
     return endpoints;
 };
 
+const normalizeEndpoints = (endpoints) => endpoints.map(ep => ({
+    ...ep,
+    path: ep.path.startsWith('/') ? ep.path : `/${ep.path}`,
+    methods: ep.methods.map(m => m.toUpperCase()),
+}));
+
 const parse = async (filePath, cliBaseUrl = null) => {
     try {
+        // A live GraphQL endpoint URL — discovered via introspection, no local spec file involved.
+        if (/^https?:\/\//i.test(filePath)) {
+            logger.info('Detected GraphQL endpoint URL — discovering via introspection.');
+            const discovered = await graphqlAdapter.discover(filePath, cliBaseUrl);
+            return {
+                base_url: discovered.base_url,
+                protocol: discovered.protocol,
+                endpoints: normalizeEndpoints(discovered.endpoints),
+            };
+        }
+
         const absolutePath = path.resolve(filePath);
         if (!fs.existsSync(absolutePath)) {
             throw new Error(`File not found: ${filePath}`);
+        }
+
+        const ext = path.extname(absolutePath).toLowerCase();
+
+        // GraphQL SDL file
+        if (ext === '.graphql' || ext === '.gql') {
+            logger.info('Detected GraphQL SDL file.');
+            const discovered = await graphqlAdapter.discover(absolutePath, cliBaseUrl);
+            return {
+                base_url: discovered.base_url,
+                protocol: discovered.protocol,
+                endpoints: normalizeEndpoints(discovered.endpoints),
+            };
+        }
+
+        // gRPC .proto file
+        if (ext === '.proto') {
+            logger.info('Detected gRPC .proto file.');
+            const discovered = await grpcAdapter.discover(absolutePath, cliBaseUrl);
+            return {
+                base_url: discovered.base_url,
+                protocol: discovered.protocol,
+                endpoints: normalizeEndpoints(discovered.endpoints),
+                meta: discovered.meta,
+            };
         }
 
         const fileContent = fs.readFileSync(absolutePath, 'utf-8');
         let config = {};
 
         let rawData;
-        try {
-            rawData = JSON.parse(fileContent);
-        } catch (e) {
-            throw new Error('Invalid JSON file.');
+        if (ext === '.yaml' || ext === '.yml') {
+            const yaml = require('js-yaml');
+            try {
+                rawData = yaml.load(fileContent);
+            } catch (e) {
+                throw new Error(`Invalid YAML file: ${e.message}`);
+            }
+        } else {
+            try {
+                rawData = JSON.parse(fileContent);
+            } catch (e) {
+                throw new Error('Invalid JSON file.');
+            }
+        }
+
+        // Detect OpenAPI / Swagger spec (3.x `openapi` or 2.0 `swagger` top-level key)
+        if (openapiAdapter.isOpenApiDoc(rawData)) {
+            logger.info('Detected OpenAPI/Swagger specification.');
+            const discovered = await openapiAdapter.discover(absolutePath, cliBaseUrl);
+            return {
+                base_url: discovered.base_url,
+                protocol: discovered.protocol,
+                endpoints: normalizeEndpoints(discovered.endpoints),
+            };
         }
 
         // Detect Postman Collection
