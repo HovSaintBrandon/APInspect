@@ -469,6 +469,97 @@ Key points for CI:
 - Use `if: always()` on the report-upload step so you get the partial report even when the scan fails or aborts on an infrastructure error (exit code 3).
 - Treat exit code `3` differently from `1` in your pipeline logic if you want infra flakiness (AI backend down) to retry rather than fail the build outright.
 
+#### Complete, hardened manifest example
+
+The minimal example above is enough to get running, but two classes of failure show up almost immediately in practice: the collection/auth-file path doesn't actually exist in the checked-out repo (wrong path, wrong case, or gitignored secrets file never reaching the runner), and the tool version drifts silently because `main` is cloned fresh on every run. This version fixes both, plus persists the AI decision cache properly instead of writing it into a directory that gets discarded at job end:
+
+```yaml
+# .github/workflows/api-security.yml
+name: API Security Scan
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  apinspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Pin to a released tag/commit, not a moving `main` — a breaking change
+      # in APInspect itself should never silently change your gate's behavior
+      # with no diff in this repo to review.
+      - name: Install APInspect
+        run: |
+          git clone --branch v1.0.0 https://github.com/HovSaintBrandon/APInspect.git apinspect-tool
+          cd apinspect-tool && npm ci
+
+      # Materialize the auth file from secrets — it's gitignored on purpose
+      # (see "Input Files You Need to Prepare"), so it never reaches the
+      # runner via actions/checkout and must be reconstructed here.
+      - name: Write auth file from secrets
+        run: |
+          mkdir -p ci
+          cat <<'EOF' > ci/apinspect_auth.json
+          {
+            "roles": [
+              {
+                "name": "student",
+                "auth_type": "bearer",
+                "login_endpoint": "${{ secrets.LOGIN_ENDPOINT }}",
+                "method": "POST",
+                "token_path": "data.access_token",
+                "payload": { "email": "${{ secrets.STUDENT_EMAIL }}", "password": "${{ secrets.STUDENT_PASSWORD }}" }
+              }
+            ]
+          }
+          EOF
+
+      # Fail fast with a clear message instead of letting APInspect's
+      # generic parser error be the first sign something's wrong.
+      - name: Verify required files exist
+        run: |
+          test -f collections/VenuefyProd.json || { echo "::error::Missing collections/VenuefyProd.json in $(pwd)"; find . -maxdepth 3 -iname "*.json" | grep -v node_modules; exit 1; }
+          test -f ci/apinspect_auth.json || { echo "::error::Auth file still missing after materialization"; exit 1; }
+          mkdir -p reports
+
+      # Persist AI applicability/probe decisions across runs — restored
+      # before the scan, saved after, keyed on the collection's content so
+      # a changed collection invalidates stale entries automatically.
+      - uses: actions/cache@v4
+        with:
+          path: apinspect-tool/.apinspect-cache.json
+          key: apinspect-cache-${{ hashFiles('collections/VenuefyProd.json') }}
+
+      - name: Run security scan
+        env:
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+        run: |
+          node apinspect-tool/src/cli/index.js scan collections/VenuefyProd.json \
+            --checklist \
+            --style rest \
+            --base-url ${{ secrets.STAGING_API_URL }} \
+            --auth-file ci/apinspect_auth.json \
+            --cache apinspect-tool/.apinspect-cache.json \
+            --fail-on high \
+            -o reports/scan.json
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apinspect-report
+          path: reports/
+```
+
+Repo secrets to configure once (**Settings → Secrets and variables → Actions**): `CEREBRAS_API_KEY`, `STAGING_API_URL`, `LOGIN_ENDPOINT`, `STUDENT_EMAIL`, `STUDENT_PASSWORD` (add one email/password pair per role in your auth file).
+
 ### GitLab CI
 
 ```yaml
