@@ -434,6 +434,34 @@ jobs:
           path: reports/
 ```
 
+#### Using GitHub Secrets for the API key and target URL
+
+Both values the scan needs at runtime — `CEREBRAS_API_KEY` and the target's base URL — are ordinary strings the tool reads from an environment variable and a CLI flag respectively, which is exactly what GitHub Secrets exists to inject. Nothing tool-specific is required to make this work:
+
+- `CEREBRAS_API_KEY` is read straight from `process.env` (`src/core/cerebrasClient.js`) — the workflow above sets it under `env:` on the scan step from `${{ secrets.CEREBRAS_API_KEY }}`, so the real key is never written into the workflow file, never appears in `git log`, and is masked in the Actions log output automatically.
+- `${{ secrets.STAGING_API_URL }}` is substituted by GitHub *before* the shell command runs, so it's passed to `--base-url` like any other value — APInspect never has to know it came from a secret.
+- The same applies to anything referenced by `--auth-file`: if the JSON file itself contains real credentials, don't commit it — check it into a private path outside the repo, restore it from a secret at job start (see the `Write a secret to a file` pattern below), or better, keep the file structure in the repo but store the actual `password`/`payload` values as their own secrets and template them in with `envsubst` or a small `sed` step before the scan runs.
+
+To set these up once, in the repo's **Settings → Secrets and variables → Actions**:
+
+```
+CEREBRAS_API_KEY   = <your real Cerebras key>
+STAGING_API_URL    = https://staging.internal.example.com
+```
+
+If your `auth-file` needs to carry a real secret (e.g. a test account password), a common pattern is to keep a *templated* file in the repo and materialize it in CI:
+
+```yaml
+      - name: Materialize auth file from secrets
+        run: |
+          envsubst < ci/apinspect_auth.template.json > ci/apinspect_auth.json
+        env:
+          STUDENT_PASSWORD: ${{ secrets.STUDENT_PASSWORD }}
+          LECTURER_PASSWORD: ${{ secrets.LECTURER_PASSWORD }}
+```
+
+where `ci/apinspect_auth.template.json` (safe to commit) contains `"password": "$STUDENT_PASSWORD"` in place of a literal value. This keeps every credential the scan needs — the AI key, the target URL, and any login passwords — out of the repository entirely, while still giving APInspect a normal file path and normal env vars to read at scan time. The tool has no awareness of secrets managers; it just consumes `process.env` and CLI arguments, which is what makes it drop into any CI system's existing secret-injection mechanism without modification.
+
 Key points for CI:
 - Always pass `--style` explicitly in CI — with no TTY attached, the interactive style prompt for ambiguous inputs (Postman/OpenAPI/raw JSON) will hang the job waiting for input it will never receive.
 - Store `CEREBRAS_API_KEY` and any `auth-file` credentials as encrypted CI secrets, never in the repo.
