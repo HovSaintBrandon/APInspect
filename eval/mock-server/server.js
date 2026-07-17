@@ -61,6 +61,26 @@ app.patch('/api/users/:id', (req, res) => {
     });
 });
 
+// 6. Minimal GraphQL endpoint — introspection enabled, no depth limiting (intentionally
+// vulnerable defaults so GQL-01/GQL-02 checks have something real to detect).
+const { graphql, buildSchema } = require('graphql');
+const gqlSchema = buildSchema(`
+    type User { id: ID!, email: String!, role: String! }
+    type Query {
+        me: User
+        user(id: ID!): User
+    }
+`);
+const gqlRoot = {
+    me: () => ({ id: '1', email: 'admin@example.com', role: 'admin' }),
+    user: ({ id }) => ({ id, email: `user${id}@example.com`, role: 'user' }),
+};
+app.post('/graphql', async (req, res) => {
+    const { query, variables } = req.body || {};
+    const result = await graphql({ schema: gqlSchema, source: query, rootValue: gqlRoot, variableValues: variables });
+    res.status(200).json(result);
+});
+
 const PORT = 3001;
 app.listen(PORT, () => {
     console.log(`Mock server running on port ${PORT}`);

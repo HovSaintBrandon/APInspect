@@ -40,6 +40,8 @@ apinspect scan ./my-api.json -t "my-bearer-token" -b "https://api.example.com"
 - `--auth-file <path>`: Advanced dynamic multi-role authentication (see Authentication Section).
 - `--checklist`: Enable the AI-driven checklist mode.
 - `-o, --output <path>`: Output file path (supports `.json`, `.csv`, `.falcon.csv`).
+- `--fail-on <severity>`: Fail with exit code 1 if any confirmed finding meets or exceeds this severity (`critical`, `high`, `medium`, `low`, `info`).
+- `--fail-on-tbc`: Composes with `--fail-on` to include `TO BE CONFIRMED` findings in the gate check.
 
 ### 2. Audit (`apinspect audit <file>`)
 Runs a Postman collection via the standard Newman runner and subsequently analyzes the responses for security issues, such as sensitive data leakage.
@@ -70,6 +72,30 @@ The AI pipeline acts in three stages during the scan of an endpoint:
 3. **Verdict Classifier (`verdictClassifier.js`)**: Evaluates the HTTP response from the synthesized probe. The AI assigns a status (`PASS`, `FAIL`, `N/A`, `TO BE CONFIRMED`) and a confidence score. If the AI's confidence falls below defined thresholds (e.g. `AI_FAIL_CONFIDENCE_THRESHOLD`), the tool will gracefully downgrade the verdict to `TO BE CONFIRMED` to prevent false positives.
 
 For checks in the checklist that can be covered by hardcoded scripts (e.g., standard SQLi fuzzing), the engine routes them back to the traditional deterministic modules (e.g. `injection/sqliXss`).
+
+---
+
+## CI/CD Integration & Severity Gating
+
+APInspect can be integrated directly into CI/CD pipelines to act as an automated security gate using the `--fail-on` and `--fail-on-tbc` flags.
+
+### The Two Axes: Severity vs. Confidence
+APInspect findings are evaluated on two independent axes:
+1. **Severity** ("how bad if real"): Defines the theoretical impact of the vulnerability (`Critical`, `High`, `Medium`, `Low`, `Info`). Findings keep this severity even if the AI is uncertain.
+2. **Confidence** ("how sure are we"): Whether the finding is fully `confirmed` or `to_be_confirmed` (TBC). A finding might be TBC because the AI's confidence was low, or because the scan lacked the necessary context (e.g., no authentication credentials).
+
+### Gating Semantics
+- `--fail-on <severity>`: Fails the pipeline (exit 1) if any **confirmed** finding meets or exceeds the severity threshold. TBC findings are excluded.
+- `--fail-on-tbc`: A composable flag that must be used alongside `--fail-on`. When present, the pipeline will also fail if a **TBC** finding meets or exceeds the severity threshold.
+
+**Examples**:
+```bash
+# Fail only on confirmed High/Critical vulnerabilities
+apinspect scan api.json --checklist --fail-on high
+
+# Strict Mode: Fail on confirmed High/Critical OR uncertain High/Critical findings
+apinspect scan api.json --checklist --fail-on high --fail-on-tbc
+```
 
 ---
 

@@ -7,7 +7,7 @@
 [![Node.js](https://img.shields.io/badge/Node.js-v14+-green.svg)](https://nodejs.org/)
 [![Security](https://img.shields.io/badge/Security-OWASP%20Top%2010-red.svg)](https://owasp.org/www-project-top-ten/)
 
-**A checklist-driven security scanner designed to automate the reconnaissance and vulnerability assessment of REST APIs.**
+**A checklist-driven security scanner designed to automate the reconnaissance and vulnerability assessment of REST, GraphQL, and gRPC APIs.**
 
 </div>
 
@@ -15,12 +15,22 @@
 
 ## 📖 What is APInspect?
 
-**APInspect** is a specialized security tool built to automate the tedious parts of API security testing. Unlike generic scanners, it follows a structured **Checklist Methodology**, verifying specific security controls endpoint-by-endpoint.
+**APInspect** is a specialized security tool built to automate the tedious parts of API security testing. Unlike generic scanners, it follows a structured **Checklist Methodology**, verifying specific security controls endpoint-by-endpoint — across all three major API architecture styles.
 
 It is designed for developers and security engineers to:
-1.  **Parse** API definitions (Postman Collections or JSON configs).
+1.  **Parse** API definitions — Postman collections, internal JSON, OpenAPI/Swagger specs, GraphQL SDL/introspection, or gRPC `.proto` files.
 2.  **Audit** endpoints using active probing and static analysis.
 3.  **Report** actionable findings in JSON or CSV formats.
+
+### Supported API styles
+
+| Style   | Input                                                              | Detected by |
+|---------|---------------------------------------------------------------------|-------------|
+| REST    | Postman collection, internal JSON, OpenAPI/Swagger (`.json`/`.yaml`/`.yml`) | `openapi`/`swagger` key, or Postman `info._postman_id` |
+| GraphQL | SDL file (`.graphql`/`.gql`) or a live endpoint URL (introspection)  | file extension, or `http(s)://` target |
+| gRPC    | `.proto` file + `-b host:port` target                                | `.proto` extension |
+
+Checks specific to each style live under `src/checks/graphql/` and `src/checks/grpc/` (introspection/query-depth for GraphQL; metadata auth stripping, TLS enforcement, reflection, and message-size limits for gRPC) alongside the original REST checks, which also apply to GraphQL since it runs over plain HTTP.
 
 ---
 

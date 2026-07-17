@@ -21,10 +21,14 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@apidevtools/swagger-parser": "^12.1.0",
+    "@grpc/grpc-js": "^1.14.4",
+    "@grpc/proto-loader": "^0.8.1",
     "axios": "^1.6.0",
     "chalk": "^4.1.2",
     "commander": "^11.0.0",
     "dotenv": "^17.4.2",
+    "graphql": "^17.0.2",
     "newman": "^6.2.2",
     "ora": "^5.4.1"
   },
