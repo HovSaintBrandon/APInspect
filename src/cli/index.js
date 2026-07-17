@@ -63,6 +63,7 @@ program
     .option('-u, --username <user>', 'Username for Basic Auth')
     .option('-p, --password <pass>', 'Password for Basic Auth')
     .option('-b, --base-url <url>', 'Base URL for REST/GraphQL specs, or "host:port" target for a gRPC .proto file')
+    .option('--style <style>', 'API architecture style: rest, graphql, or grpc. Prompted interactively if omitted and the input file is ambiguous (Postman/OpenAPI/JSON).')
     .option('--auth-file <path>', 'Path to JSON file containing role:token mapping or login_endpoint config')
     .option('-o, --output <path>', 'Path to save report (.json, .csv, or .falcon.csv)')
     .option('--checklist', 'Run in checklist-driven mode using src/config/checklist.json + AI layer')
@@ -88,8 +89,16 @@ program
             }
             const failOnThreshold = options.failOn ? options.failOn.toLowerCase() : null;
 
+            // Validate --style if provided
+            const VALID_STYLES = ['rest', 'graphql', 'grpc'];
+            if (options.style && !VALID_STYLES.includes(options.style.toLowerCase())) {
+                logger.error(`Invalid --style: "${options.style}". Valid values: rest, graphql, grpc`);
+                process.exit(2);
+            }
+            const cliStyle = options.style ? options.style.toLowerCase() : null;
+
             // 1. Parse Input
-            const config = await parse(file, options.baseUrl);
+            const config = await parse(file, options.baseUrl, cliStyle);
 
             // 2. Initialise AI cache (if --cache is set)
             let aiCache = null;

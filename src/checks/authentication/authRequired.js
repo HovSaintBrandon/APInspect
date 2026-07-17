@@ -19,33 +19,44 @@ module.exports = async (context, client, endpoint) => {
         const reqConfig = {
             method: method,
             url: endpoint.path,
-            headers: {}, // Reset headers
+            headers: {},
         };
 
-        // Explicitly remove standard auth headers if they exist in global config
-        // (This is a simplified approach; specific header keys depend on auth type)
+        // The shared client instance carries auth headers as axios defaults, which a
+        // per-request {} does not override. Axios only drops a default header when the
+        // request explicitly sets that key to null, so clear it that way instead.
         if (context.auth.type === 'bearer' || context.auth.type === 'basic') {
-            reqConfig.headers['Authorization'] = '';
-            // Note: Axios might still send empty header. Ideally we strictly omit it.
-            delete reqConfig.headers['Authorization'];
+            reqConfig.headers['Authorization'] = null;
         }
-        // For specific headers
         if (context.auth.type === 'header') {
-            reqConfig.headers[context.auth.key] = '';
+            reqConfig.headers[context.auth.key] = null;
         }
 
-        // Perform request
-        await client.request(reqConfig);
+        // validateStatus is configured to never throw (see httpClient.js), so the
+        // no-auth response resolves normally here regardless of status code.
+        const response = await client.request(reqConfig);
+        const status = response.status;
 
-        // If we reach here, the request succeeded (2xx) WITHOUT auth.
-        // That means it looks like a FAIL (Publicly accessible).
-        // BUT some endpoints are meant to be public. 
-        // For now we flag it as FAIL/WARN.
+        if (status === 401 || status === 403) {
+            return {
+                status: 'PASS',
+                message: `Endpoint ${method} ${endpoint.path} correctly blocked unauthenticated access (Status: ${status}).`,
+                details: { status }
+            };
+        }
+
+        if (status >= 200 && status < 300) {
+            return {
+                status: 'FAIL',
+                message: `Endpoint ${method} ${endpoint.path} accessed successfully without authentication.`,
+                details: { access: 'unauthenticated', status }
+            };
+        }
 
         return {
-            status: 'FAIL',
-            message: `Endpoint ${method} ${endpoint.path} accessed successfully without authentication.`,
-            details: { access: 'unauthenticated' }
+            status: 'MANUAL',
+            message: `Endpoint returned ${status} without auth. Needs manual verification.`,
+            details: { status }
         };
 
     } catch (error) {

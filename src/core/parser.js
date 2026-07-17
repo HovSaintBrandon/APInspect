@@ -73,7 +73,28 @@ const normalizeEndpoints = (endpoints) => endpoints.map(ep => ({
     methods: ep.methods.map(m => m.toUpperCase()),
 }));
 
-const parse = async (filePath, cliBaseUrl = null) => {
+// Ambiguous inputs (Postman collections, OpenAPI/Swagger specs, raw internal JSON) could
+// describe a REST API or a single GraphQL endpoint fronted by REST-shaped tooling — the file
+// extension alone doesn't tell us. Unambiguous inputs (.graphql/.gql, .proto, a live GraphQL
+// URL) already carry their own protocol and skip this prompt entirely.
+const resolveAmbiguousStyle = async (cliStyle) => {
+    if (cliStyle) return cliStyle;
+
+    const readline = require('readline');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise(resolve => {
+        logger.warn('API architecture style not specified.');
+        rl.question('? Select API style — rest / graphql / grpc [rest]: ', ans => {
+            rl.close();
+            resolve(ans.trim().toLowerCase());
+        });
+    });
+
+    if (answer === 'graphql' || answer === 'grpc') return answer;
+    return 'rest';
+};
+
+const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
     try {
         // A live GraphQL endpoint URL — discovered via introspection, no local spec file involved.
         if (/^https?:\/\//i.test(filePath)) {
@@ -138,17 +159,19 @@ const parse = async (filePath, cliBaseUrl = null) => {
         // Detect OpenAPI / Swagger spec (3.x `openapi` or 2.0 `swagger` top-level key)
         if (openapiAdapter.isOpenApiDoc(rawData)) {
             logger.info('Detected OpenAPI/Swagger specification.');
+            const style = await resolveAmbiguousStyle(cliStyle);
             const discovered = await openapiAdapter.discover(absolutePath, cliBaseUrl);
             return {
                 base_url: discovered.base_url,
-                protocol: discovered.protocol,
-                endpoints: normalizeEndpoints(discovered.endpoints),
+                protocol: style,
+                endpoints: normalizeEndpoints(discovered.endpoints).map(ep => ({ ...ep, protocol: style })),
             };
         }
 
         // Detect Postman Collection
         if (rawData.info && rawData.info._postman_id) {
             logger.info('Detected Postman Collection.');
+            const style = await resolveAmbiguousStyle(cliStyle);
 
             const variables = rawData.variable || [];
             const baseUrlVar = variables.find(v => v.key === 'baseUrl');
@@ -185,11 +208,13 @@ const parse = async (filePath, cliBaseUrl = null) => {
             }
 
             config.endpoints = extractPostmanEndpoints(rawData.item, variables);
+            config.protocol = style;
             logger.info(`Extracted ${config.endpoints.length} endpoints from Postman collection.`);
 
         } else {
             // Assume Standard Internal JSON Format
             config = rawData;
+            if (!config.protocol) config.protocol = await resolveAmbiguousStyle(cliStyle);
         }
 
         // Validate
@@ -202,7 +227,8 @@ const parse = async (filePath, cliBaseUrl = null) => {
         config.endpoints = config.endpoints.map(ep => ({
             ...ep,
             path: ep.path.startsWith('/') ? ep.path : `/${ep.path}`,
-            methods: ep.methods ? ep.methods.map(m => m.toUpperCase()) : ['GET']
+            methods: ep.methods ? ep.methods.map(m => m.toUpperCase()) : ['GET'],
+            protocol: ep.protocol || config.protocol,
         }));
 
         return config;
