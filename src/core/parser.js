@@ -5,6 +5,36 @@ const openapiAdapter = require('../adapters/rest/openapiAdapter');
 const graphqlAdapter = require('../adapters/graphql/graphqlAdapter');
 const grpcAdapter = require('../adapters/grpc/grpcAdapter');
 
+// Postman requests carry their payload in `request.body`, shaped differently per mode.
+// Pull out something JSON-fuzzable so injection/DAST checks can mutate it, same as they
+// already do for OpenAPI requestBody examples and internal-JSON `body`/`payload` fields.
+const extractPostmanBody = (requestBody) => {
+    if (!requestBody?.mode) return null;
+
+    if (requestBody.mode === 'raw') {
+        try {
+            return JSON.parse(requestBody.raw);
+        } catch {
+            return requestBody.raw;
+        }
+    }
+
+    if (requestBody.mode === 'urlencoded' || requestBody.mode === 'formdata') {
+        const list = requestBody[requestBody.mode] || [];
+        const obj = {};
+        list.forEach(({ key, value, disabled }) => {
+            if (!disabled && key) obj[key] = value;
+        });
+        return obj;
+    }
+
+    if (requestBody.mode === 'graphql' && requestBody.graphql) {
+        return requestBody.graphql;
+    }
+
+    return null;
+};
+
 // Simple validation schema
 const validateConfig = (config) => {
     const errors = [];
@@ -59,7 +89,8 @@ const extractPostmanEndpoints = (items, variables = []) => {
             endpoints.push({
                 path: finalPath.startsWith('/') ? finalPath : '/' + finalPath,
                 methods: [method],
-                originalName: item.name
+                originalName: item.name,
+                body: extractPostmanBody(item.request.body)
             });
         }
     });
@@ -229,6 +260,8 @@ const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
             path: ep.path.startsWith('/') ? ep.path : `/${ep.path}`,
             methods: ep.methods ? ep.methods.map(m => m.toUpperCase()) : ['GET'],
             protocol: ep.protocol || config.protocol,
+            // Internal JSON specs may name the sample request payload `body` or `payload`.
+            body: ep.body || ep.payload || null,
         }));
 
         return config;

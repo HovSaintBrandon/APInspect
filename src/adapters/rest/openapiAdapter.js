@@ -1,6 +1,7 @@
 const path = require('path');
 const SwaggerParser = require('@apidevtools/swagger-parser');
 const logger = require('../../utils/logger');
+const { extractExampleBody } = require('../../utils/bodyFuzzer');
 
 // Detect whether a parsed JSON/YAML object is an OpenAPI (3.x) or Swagger (2.0) document.
 const isOpenApiDoc = (rawData) => {
@@ -40,6 +41,9 @@ const extractOpenApiEndpoints = (api) => {
                 methods: [method.toUpperCase()],
                 originalName: operation.operationId || operation.summary || `${method.toUpperCase()} ${rawPath}`,
                 protocol: 'rest',
+                // Sample payload derived from the spec's requestBody — fed to injection/DAST
+                // checks so POST/PUT/PATCH endpoints get fuzzed the same way GET query params do.
+                body: extractExampleBody(operation.requestBody),
                 schema: {
                     parameters: operation.parameters || pathItem.parameters || [],
                     requestBody: operation.requestBody || null,
