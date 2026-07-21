@@ -12,7 +12,7 @@ const staticAnalyzer = require('../core/staticAnalyzer');
 const newmanRunner = require('../core/newmanRunner');
 const logger = require('../utils/logger');
 const packageJson = require('../../package.json');
-const { InfrastructureError } = require('../utils/errors');
+const { resolveAuthMap, authValueToHeaders } = require('./authResolver');
 
 const program = new Command();
 
@@ -108,114 +108,7 @@ program
             }
 
             // 2. Auth handling
-            let authMap = {};
-            if (options.authFile) {
-                const absPath = require('path').resolve(options.authFile);
-                if (!require('fs').existsSync(absPath)) {
-                    throw new Error(`Auth file not found: ${options.authFile}`);
-                }
-                const authConfig = require(absPath);
-                
-                if (authConfig.login_endpoint && authConfig.roles) {
-                    logger.info(`Fetching dynamic tokens from ${authConfig.login_endpoint}...`);
-                    const axios = require('axios');
-                    
-                    for (const role of authConfig.roles) {
-                        try {
-                            const res = await axios({
-                                method: authConfig.method || 'POST',
-                                url: authConfig.login_endpoint,
-                                data: role.payload,
-                                headers: { 'Content-Type': 'application/json' }
-                            });
-                            
-                            const pathParts = (authConfig.token_path || 'token').split('.');
-                            let token = res.data;
-                            for (const part of pathParts) {
-                                if (token) token = token[part];
-                            }
-                            
-                            if (token) {
-                                authMap[role.name] = { type: 'bearer', token };
-                                logger.info(`✅ Successfully fetched token for role: ${role.name}`);
-                            } else {
-                                throw new InfrastructureError(
-                                    `Token path '${authConfig.token_path}' not found in response for role '${role.name}'. ` +
-                                    `Cannot proceed — scan without authentication would manufacture false confidence.`
-                                );
-                            }
-                        } catch (err) {
-                            if (err.name === 'InfrastructureError') throw err;
-                            throw new InfrastructureError(`Failed to fetch token for role '${role.name}': ${err.message}`);
-                        }
-                    }
-                } else if (Array.isArray(authConfig.roles)) {
-                    // Per-role schema: each role declares its own auth_type
-                    // Supports 'bearer' (dynamic JWT fetch) and 'basic' (pre-encoded header)
-                    logger.info(`Processing ${authConfig.roles.length} roles from auth file...`);
-                    const axios = require('axios');
-
-                    for (const role of authConfig.roles) {
-                        if (role.auth_type === 'basic') {
-                            // Build Basic Auth header directly from credentials — no login endpoint needed
-                            const encoded = Buffer.from(
-                                `${role.credentials.username}:${role.credentials.password}`
-                            ).toString('base64');
-                            authMap[role.name] = {
-                                type: 'basic',
-                                header: `Basic ${encoded}`,
-                                username: role.credentials.username,
-                                password: role.credentials.password
-                            };
-                            logger.info(`🔑 Loaded Basic Auth for role: ${role.name} (user: ${role.credentials.username})`);
-
-                        } else if (role.auth_type === 'bearer') {
-                            // Dynamically fetch a JWT from the role's own login_endpoint
-                            try {
-                                const res = await axios({
-                                    method: role.method || 'POST',
-                                    url: role.login_endpoint,
-                                    data: role.payload,
-                                    headers: { 'Content-Type': 'application/json' }
-                                });
-
-                                const pathParts = (role.token_path || 'token').split('.');
-                                let token = res.data;
-                                for (const part of pathParts) {
-                                    if (token) token = token[part];
-                                }
-
-                                if (token) {
-                                    authMap[role.name] = { type: 'bearer', token };
-                                    logger.info(`✅ Fetched Bearer token for role: ${role.name}`);
-                                } else {
-                                    throw new InfrastructureError(
-                                        `token_path '${role.token_path}' not found in response for role '${role.name}'. ` +
-                                        `Cannot proceed — scan without authentication would manufacture false confidence.`
-                                    );
-                                }
-                            } catch (err) {
-                                if (err.name === 'InfrastructureError') throw err;
-                                throw new InfrastructureError(`Failed to fetch token for role '${role.name}': ${err.message}`);
-                            }
-                        } else {
-                            logger.warn(`⚠ Unknown auth_type '${role.auth_type}' for role ${role.name} — skipping.`);
-                        }
-                    }
-                } else {
-                    // Legacy flat mapping format fallback
-                    authMap = authConfig;
-                    logger.info(`Loaded auth map with ${Object.keys(authMap).length} roles.`);
-                }
-            } else if (options.token) {
-                authMap = { default: { type: 'bearer', token: options.token } };
-                logger.info('Using provided bearer token.');
-            } else if (options.username && options.password) {
-                authMap = { default: { type: 'basic', username: options.username, password: options.password } };
-                logger.info('Using provided Basic Auth credentials.');
-            } else {
-                authMap = { unauthenticated: null };
-            }
+            const authMap = await resolveAuthMap(options);
 
             // Run scan for each role
             for (const [role, authValue] of Object.entries(authMap)) {
@@ -344,6 +237,71 @@ program
                 process.exit(3); // 3 = Infrastructure/Network Failure
             }
             logger.error(`Scan failed: ${err.message}`);
+            process.exit(1);
+        }
+    });
+
+const headerFindingLine = (finding) => {
+    const base = `${finding.header}: ${finding.message}`;
+    return finding.recommendation ? `${base} → ${finding.recommendation}` : base;
+};
+
+const printHeaderGradeReport = (result, requestedUrl, finalUrl) => {
+    logger.title(`\nGrade: ${result.grade}  (${result.score}/100)`);
+    if (finalUrl !== requestedUrl) logger.info(`Followed redirect to: ${finalUrl}`);
+
+    for (const finding of result.findings) {
+        const line = headerFindingLine(finding);
+        if (finding.status === 'GOOD') logger.success(line);
+        else if (finding.status === 'INFO' || finding.status === 'N/A') logger.info(line);
+        else logger.warn(line);
+    }
+};
+
+const writeHeaderGradeResult = (outputPath, payload) => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const outPath = path.resolve(outputPath);
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(outPath, JSON.stringify(payload, null, 2));
+    logger.success(`\nResult saved to ${outPath}`);
+};
+
+program
+    .command('headers <url>')
+    .description('Grade the security headers of a single URL (securityheaders.com-style), without running a full scan')
+    .option('-t, --token <token>', 'Bearer token for authentication')
+    .option('-u, --username <user>', 'Username for Basic Auth')
+    .option('-p, --password <pass>', 'Password for Basic Auth')
+    .option('--auth-file <path>', 'Path to JSON file containing role:token mapping or login_endpoint config')
+    .option('-o, --output <path>', 'Path to save the grading result as JSON')
+    .action(async (url, options) => {
+        try {
+            const axios = require('axios');
+            const authMap = await resolveAuthMap(options);
+            const authHeaders = authValueToHeaders(authMap.default);
+
+            logger.title(`Fetching headers for ${url}...`);
+            const response = await axios.get(url, {
+                headers: authHeaders,
+                maxRedirects: 10, // follow to the final destination — grade that, not the 30x hop
+                validateStatus: () => true,
+            });
+
+            // Node's http client records the post-redirect URL at res.responseUrl.
+            const finalUrl = response.request?.res?.responseUrl || url;
+            const isHttps = finalUrl.startsWith('https');
+
+            const headerGrader = require('../core/headerGrader');
+            const result = headerGrader.grade(response.headers, { isHttps });
+
+            printHeaderGradeReport(result, url, finalUrl);
+
+            if (options.output) {
+                writeHeaderGradeResult(options.output, { url, finalUrl, ...result });
+            }
+        } catch (err) {
+            logger.error(`Header grading failed: ${err.message}`);
             process.exit(1);
         }
     });

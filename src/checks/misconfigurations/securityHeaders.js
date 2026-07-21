@@ -1,40 +1,36 @@
-module.exports = async (context, client, endpoint) => {
+const headerGrader = require('../../core/headerGrader');
+
+// Grades below this get FAIL, below this-but-above the next get WARN, rest PASS.
+const FAIL_BELOW_GRADE = new Set(['F', 'E']);
+const WARN_BELOW_GRADE = new Set(['D', 'C']);
+
+module.exports = async function securityHeadersCheck(context, client, endpoint) {
     try {
         const response = await client.request({
             method: endpoint.methods[0] || 'GET',
             url: endpoint.path,
         });
 
-        const headers = response.headers;
-        const missingHeaders = [];
-        const insecureHeaders = [];
+        const isHttps = context.baseUrl.startsWith('https');
+        const result = headerGrader.grade(response.headers, { isHttps });
 
-        // Check for Missing Security Headers
-        if (!headers['strict-transport-security'] && context.baseUrl.startsWith('https')) missingHeaders.push('Strict-Transport-Security');
-        if (!headers['x-content-type-options']) missingHeaders.push('X-Content-Type-Options');
-        if (!headers['x-frame-options']) missingHeaders.push('X-Frame-Options');
-        // CSP is complex, but check existence
-        if (!headers['content-security-policy']) missingHeaders.push('Content-Security-Policy');
+        let status = 'PASS';
+        if (FAIL_BELOW_GRADE.has(result.grade)) status = 'FAIL';
+        else if (WARN_BELOW_GRADE.has(result.grade)) status = 'WARN';
 
-        // Check for Information Leakage Headers
-        if (headers['x-powered-by']) insecureHeaders.push(`X-Powered-By: ${headers['x-powered-by']}`);
-        if (headers['server']) insecureHeaders.push(`Server: ${headers['server']}`);
-
-        if (missingHeaders.length > 0 || insecureHeaders.length > 0) {
-            return {
-                status: 'WARN', // Warn because not all checks are critical for all APIs
-                message: 'Security header misconfigurations detected.',
-                details: { missing: missingHeaders, leaking: insecureHeaders }
-            };
-        }
+        const actionable = result.findings.filter(f => ['MISSING', 'WEAK', 'LEAK'].includes(f.status));
 
         return {
-            status: 'PASS',
-            message: 'Basic security headers are present.',
-            details: {}
+            status,
+            message: `Security headers grade: ${result.grade} (${result.score}/100).`,
+            details: {
+                grade: result.grade,
+                score: result.score,
+                findings: result.findings,
+                recommendations: actionable.map(f => ({ header: f.header, recommendation: f.recommendation })),
+            },
         };
-
     } catch (error) {
-        return { status: 'PASS', message: 'Skipped headers check (request failed).', details: {} };
+        return { status: 'PASS', message: `Skipped headers check (request failed: ${error.message}).`, details: {} };
     }
 };

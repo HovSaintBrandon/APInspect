@@ -1,0 +1,100 @@
+[
+  {
+    "header": "strict-transport-security",
+    "label": "Strict-Transport-Security",
+    "weight": 20,
+    "httpsOnly": true,
+    "recommendation": "Add Strict-Transport-Security: max-age=31536000; includeSubDomains; preload",
+    "partialCredit": [
+      { "test": "maxAgeBelow6Months", "penaltyFraction": 0.5, "note": "max-age is below 6 months (15552000s)" },
+      { "test": "missingIncludeSubDomains", "penaltyFraction": 0.25, "note": "missing includeSubDomains directive" }
+    ]
+  },
+  {
+    "header": "content-security-policy",
+    "label": "Content-Security-Policy",
+    "weight": 25,
+    "httpsOnly": false,
+    "recommendation": "Add a Content-Security-Policy with an explicit default-src and no unsafe-inline/unsafe-eval, e.g. default-src 'self'",
+    "partialCredit": [
+      { "test": "unsafeInline", "penaltyFraction": 0.5, "note": "allows 'unsafe-inline'" },
+      { "test": "unsafeEval", "penaltyFraction": 0.5, "note": "allows 'unsafe-eval'" },
+      { "test": "wildcardSource", "penaltyFraction": 0.4, "note": "uses a wildcard (*) source" },
+      { "test": "missingDefaultSrc", "penaltyFraction": 0.3, "note": "missing default-src fallback directive" }
+    ]
+  },
+  {
+    "header": "x-frame-options",
+    "label": "X-Frame-Options",
+    "weight": 10,
+    "httpsOnly": false,
+    "recommendation": "Add X-Frame-Options: DENY (or SAMEORIGIN), or rely on CSP frame-ancestors",
+    "supersededByCsp": "frame-ancestors",
+    "partialCredit": [
+      { "test": "weakValue", "penaltyFraction": 0.5, "note": "value is neither DENY nor SAMEORIGIN" }
+    ]
+  },
+  {
+    "header": "x-content-type-options",
+    "label": "X-Content-Type-Options",
+    "weight": 10,
+    "httpsOnly": false,
+    "recommendation": "Add X-Content-Type-Options: nosniff",
+    "partialCredit": [
+      { "test": "weakValue", "penaltyFraction": 1.0, "note": "value is not exactly 'nosniff'" }
+    ]
+  },
+  {
+    "header": "referrer-policy",
+    "label": "Referrer-Policy",
+    "weight": 10,
+    "httpsOnly": false,
+    "recommendation": "Add Referrer-Policy: strict-origin-when-cross-origin (or no-referrer)",
+    "partialCredit": [
+      { "test": "unsafeUrl", "penaltyFraction": 1.0, "note": "value 'unsafe-url' leaks full URLs cross-origin" }
+    ]
+  },
+  {
+    "header": "permissions-policy",
+    "label": "Permissions-Policy",
+    "weight": 10,
+    "httpsOnly": false,
+    "recommendation": "Add a Permissions-Policy restricting sensitive features, e.g. geolocation=(), camera=(), microphone=()",
+    "partialCredit": []
+  },
+  {
+    "header": "x-xss-protection",
+    "label": "X-XSS-Protection",
+    "weight": 0,
+    "httpsOnly": false,
+    "informational": true,
+    "recommendation": "Deprecated header — modern browsers ignore it; rely on CSP instead. Safe to omit or set to '0'.",
+    "partialCredit": [
+      { "test": "enabledBlockMode", "penaltyFraction": 0, "note": "enables the deprecated XSS auditor, which can itself be exploited to suppress content" }
+    ]
+  },
+  {
+    "header": "server",
+    "label": "Server",
+    "weight": 5,
+    "leaking": true,
+    "recommendation": "Remove or generalize the Server header so it does not disclose software name/version",
+    "partialCredit": []
+  },
+  {
+    "header": "x-powered-by",
+    "label": "X-Powered-By",
+    "weight": 5,
+    "leaking": true,
+    "recommendation": "Remove the X-Powered-By header (framework fingerprinting aid)",
+    "partialCredit": []
+  },
+  {
+    "header": "x-aspnet-version",
+    "label": "X-AspNet-Version",
+    "weight": 5,
+    "leaking": true,
+    "recommendation": "Remove the X-AspNet-Version header (framework version fingerprinting aid)",
+    "partialCredit": []
+  }
+]
