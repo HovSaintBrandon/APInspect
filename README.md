@@ -19,6 +19,7 @@
 - [How It Works](#how-it-works)
 - [Supported API Styles](#supported-api-styles)
 - [What Gets Checked](#what-gets-checked)
+  - [Security Header Grading](#security-header-grading)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Input Files You Need to Prepare](#input-files-you-need-to-prepare)
@@ -93,7 +94,7 @@ Style-specific checks live under `src/checks/graphql/` (introspection exposure, 
 | Authentication | Enforcement, server-side token validation, broken object-level authorization (BOLA) |
 | Injection | SQLi/XSS fuzzing, path traversal, SSRF-style internal-URL rejection |
 | Data Exposure | Emails, SSNs, private keys, AWS keys, JWTs, Stripe/Google API keys, over-fetching |
-| Misconfigurations | CORS wildcard/reflected-origin, missing security headers, version disclosure |
+| Misconfigurations | CORS wildcard/reflected-origin, security-header grading (securityheaders.com-style A+–F, see below), version disclosure |
 | Error Handling | Stack traces, verbose framework errors |
 | Rate Limiting | Brute-force burst testing, header-spoofing bypass attempts |
 | Mass Assignment | Privileged-field injection (`role`, `isAdmin`, `ownerId`) |
@@ -103,6 +104,19 @@ Style-specific checks live under `src/checks/graphql/` (introspection exposure, 
 | GraphQL Security | Introspection exposure, query-depth DoS |
 | gRPC Security | Metadata auth stripping, TLS enforcement, reflection, message-size limits |
 | WebSocket Security | Auth on upgrade, message-level authorization |
+
+### Security Header Grading
+
+`misconfigurations/securityHeaders` doesn't just check presence — it grades the response headers the way [securityheaders.com](https://securityheaders.com) does, from a rule set APInspect owns outright (`src/config/securityHeaderRules.json`), scored by `src/core/headerGrader.js`:
+
+- **Weighted scoring, not a naive count** — each header (`Strict-Transport-Security`, `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`) contributes a weight toward a 0–100 score, mapped to a letter grade (`A+` down to `F`).
+- **Value quality, not just existence** — a present-but-weak header still loses points: `unsafe-inline`/`unsafe-eval`/wildcard sources in CSP, HSTS `max-age` under 6 months or missing `includeSubDomains`, `X-Frame-Options` set to anything other than `DENY`/`SAMEORIGIN`, `Referrer-Policy: unsafe-url`, etc.
+- **Fingerprinting/leak headers are penalized** — `Server`, `X-Powered-By`, `X-AspNet-Version` subtract from the score if present, since they aid reconnaissance without protecting anything.
+- **Deprecated headers are informational only** — `X-XSS-Protection` no longer affects scoring; modern browsers ignore it.
+- Every finding carries a concrete `recommendation` (e.g. the exact header/value to add), returned in `details.findings` on the check result.
+- `misconfigurations/securityHeaders` maps the letter grade back to the engine's `PASS`/`WARN`/`FAIL` contract (`A`/`A+`/`B` → `PASS`, `C`/`D` → `WARN`, `E`/`F` → `FAIL`) so it plugs into `--fail-on` gating like any other check.
+
+Grading logic lives entirely in this repo — no third-party API, no rate limits, editable rule set. See the standalone [`apinspect headers <url>`](#apinspect-headers-url--single-url-header-grade-no-scan-required) command below to run just this check against a single URL.
 
 ---
 
@@ -270,6 +284,33 @@ Inspects a Postman collection's structure for definitional issues without touchi
 
 ```bash
 apinspect analyze <file>
+```
+
+### `apinspect headers <url>` — single-URL header grade, no scan required
+
+Runs just the security-header grader (see [Security Header Grading](#security-header-grading)) against one URL, without needing an API definition file, discovery, or the checklist engine. Useful for a quick check against a base URL before committing to a full scan.
+
+```bash
+apinspect headers https://api.example.com
+```
+
+Follows redirects and grades the **final** destination, not the `3xx` hop. Supports the same auth options as `scan`:
+
+| Option | Description |
+|---|---|
+| `-t, --token <token>` | Bearer token for authentication |
+| `-u, --username <user>` / `-p, --password <pass>` | Basic Auth credentials |
+| `--auth-file <path>` | Same auth-file format as `scan` — see [Authentication](#authentication) (only the `default`/first role is used) |
+| `-o, --output <path>` | Write the grade + findings as JSON |
+
+Example output:
+
+```
+Grade: B  (69/100)
+✔ Strict-Transport-Security: present and correctly configured.
+⚠ Content-Security-Policy: present but weak: allows 'unsafe-inline'. → Add a Content-Security-Policy with an explicit default-src and no unsafe-inline/unsafe-eval, e.g. default-src 'self'
+⚠ Permissions-Policy: missing. → Add a Permissions-Policy restricting sensitive features, e.g. geolocation=(), camera=(), microphone=()
+⚠ Server: discloses server implementation details. → Remove or generalize the Server header
 ```
 
 ---
@@ -618,12 +659,15 @@ When scanning with a multi-role `--auth-file`, per-role reports are written auto
 
 ```
 src/
-  cli/index.js              CLI entry point (commander) — scan / audit / analyze
+  cli/
+    index.js                 CLI entry point (commander) — scan / audit / analyze / headers
+    authResolver.js          Shared auth-file/token/basic-auth resolution (scan + headers)
   core/
     parser.js                Input detection + normalization (Postman/OpenAPI/GraphQL/gRPC)
     engine.js                Main scan loop — checklist mode + legacy mode
     context.js                Per-scan state: auth, endpoints, variable store, results
     discovery.js              Pre-scan reachability + variable harvesting
+    headerGrader.js           securityheaders.com-style header scoring engine (no network)
     cerebrasClient.js         AI backend HTTP client (retries, error classification)
     ai/
       applicabilityEngine.js  Which checklist items apply to this endpoint
@@ -635,6 +679,7 @@ src/
   reporters/                  json / csv / FALCON reporters
   config/
     checklist.json            The 34-item security checklist
+    securityHeaderRules.json   Header grading rule set — weights, quality checks, recommendations
     aiConfig.js                Model + confidence threshold configuration
 eval/
   run.js                      Eval harness against a mock server + ground truth
