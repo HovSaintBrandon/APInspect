@@ -246,8 +246,21 @@ const headerFindingLine = (finding) => {
     return finding.recommendation ? `${base} → ${finding.recommendation}` : base;
 };
 
+// securityheaders.com-style grade colors: green (A) fading through yellow/orange to red (F).
+const GRADE_COLORS = {
+    'A+': chalk.hex('#00b34a').bold,
+    'A': chalk.hex('#4caf50').bold,
+    'B': chalk.hex('#8bc34a').bold,
+    'C': chalk.hex('#ffc107').bold,
+    'D': chalk.hex('#ff9800').bold,
+    'E': chalk.hex('#ff5722').bold,
+    'F': chalk.hex('#f44336').bold,
+};
+
+const colorGrade = (grade) => (GRADE_COLORS[grade] || chalk.bold)(grade);
+
 const printHeaderGradeReport = (result, requestedUrl, finalUrl) => {
-    logger.title(`\nGrade: ${result.grade}  (${result.score}/100)`);
+    logger.title(`\nGrade: ${colorGrade(result.grade)}  (${result.score}/100)`);
     if (finalUrl !== requestedUrl) logger.info(`Followed redirect to: ${finalUrl}`);
 
     for (const finding of result.findings) {
@@ -255,6 +268,45 @@ const printHeaderGradeReport = (result, requestedUrl, finalUrl) => {
         if (finding.status === 'GOOD') logger.success(line);
         else if (finding.status === 'INFO' || finding.status === 'N/A') logger.info(line);
         else logger.warn(line);
+    }
+};
+
+// Findings worth asking the AI to explain — headers that hurt the score or leak info.
+const AI_RELEVANT_STATUSES = new Set(['MISSING', 'WEAK', 'LEAK']);
+
+const AI_SYSTEM_PROMPT = `You are an application security expert reviewing HTTP security header findings.
+For each finding provided, explain the concrete security risk of the issue and a specific mitigation.
+Respond with strict JSON only, matching this shape:
+{ "analyses": [ { "header": string, "risk": string, "mitigation": string } ] }
+Keep each "risk" and "mitigation" to 1-2 concise sentences. Do not include headers that were not provided.`;
+
+const getAiHeaderRecommendations = async (findings) => {
+    const relevant = findings.filter(f => AI_RELEVANT_STATUSES.has(f.status));
+    if (relevant.length === 0) return [];
+
+    const cerebrasClient = require('../core/cerebrasClient');
+    const userContent = relevant.map(f => ({
+        header: f.header,
+        status: f.status,
+        value: f.value,
+        message: f.message,
+    }));
+
+    const parsed = await cerebrasClient.callCerebras({
+        systemPrompt: AI_SYSTEM_PROMPT,
+        userContent,
+    });
+
+    return Array.isArray(parsed?.analyses) ? parsed.analyses : [];
+};
+
+const printAiHeaderRecommendations = (analyses) => {
+    if (analyses.length === 0) return;
+    logger.title('\nAI Risk Analysis & Mitigations:');
+    for (const item of analyses) {
+        logger.subTitle(`\n${item.header}`);
+        logger.warn(`Risk: ${item.risk}`);
+        logger.success(`Mitigation: ${item.mitigation}`);
     }
 };
 
@@ -275,6 +327,7 @@ program
     .option('-p, --password <pass>', 'Password for Basic Auth')
     .option('--auth-file <path>', 'Path to JSON file containing role:token mapping or login_endpoint config')
     .option('-o, --output <path>', 'Path to save the grading result as JSON')
+    .option('-AI, --ai', 'Include AI-generated risk analysis and mitigations for weak/missing headers')
     .action(async (url, options) => {
         try {
             const axios = require('axios');
@@ -297,8 +350,18 @@ program
 
             printHeaderGradeReport(result, url, finalUrl);
 
+            let aiAnalyses;
+            if (options.ai) {
+                try {
+                    aiAnalyses = await getAiHeaderRecommendations(result.findings);
+                    printAiHeaderRecommendations(aiAnalyses);
+                } catch (aiErr) {
+                    logger.error(`AI recommendation request failed: ${aiErr.message}`);
+                }
+            }
+
             if (options.output) {
-                writeHeaderGradeResult(options.output, { url, finalUrl, ...result });
+                writeHeaderGradeResult(options.output, { url, finalUrl, ...result, ...(aiAnalyses ? { aiAnalyses } : {}) });
             }
         } catch (err) {
             logger.error(`Header grading failed: ${err.message}`);
