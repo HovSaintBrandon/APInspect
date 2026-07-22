@@ -6,10 +6,10 @@ const grpcAdapter = require('./grpc/grpcAdapter');
 // present the same axios-shaped facade (see grpcAdapter.js for why).
 module.exports = {
     rest: {
-        createClient: (config, context) => createHttpClient(config.base_url, context.getAuthHeaders(), 5000, context),
+        createClient: (config, context) => createHttpClient(config.base_url, { ...context.headers, ...context.getAuthHeaders() }, 5000, context),
     },
     graphql: {
-        createClient: (config, context) => createHttpClient(config.base_url, context.getAuthHeaders(), 5000, context),
+        createClient: (config, context) => createHttpClient(config.base_url, { ...context.headers, ...context.getAuthHeaders() }, 5000, context),
     },
     grpc: {
         createClient: (config) => grpcAdapter.createClient(config),

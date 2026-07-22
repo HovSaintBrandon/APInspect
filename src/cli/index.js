@@ -369,4 +369,137 @@ program
         }
     });
 
+// -----------------------------------------------------------------------------
+// `check` — full hardcoded-check sweep against a single live endpoint, no
+// collection/spec file required. Everything the endpoint needs (method, extra
+// headers, body, auth) is passed directly on the command line.
+// -----------------------------------------------------------------------------
+const parseHeaderList = (headerList = []) => {
+    const headers = {};
+    for (const entry of headerList) {
+        const idx = entry.indexOf(':');
+        if (idx === -1) {
+            throw new Error(`Invalid --header value "${entry}" — expected "Key: Value"`);
+        }
+        headers[entry.slice(0, idx).trim()] = entry.slice(idx + 1).trim();
+    }
+    return headers;
+};
+
+const parseBodyOption = (data) => {
+    if (!data) return undefined;
+    const fs = require('node:fs');
+    const raw = data.startsWith('@') ? fs.readFileSync(data.slice(1), 'utf8') : data;
+    try {
+        return JSON.parse(raw);
+    } catch (e) {
+        return raw;
+    }
+};
+
+const AI_CHECK_SYSTEM_PROMPT = `You are an application security expert analyzing a single live HTTP request/response exchange
+captured from a manual endpoint check. Identify concrete security issues evidenced by the response (e.g. missing/weak auth
+enforcement, verbose errors or stack traces, sensitive data exposure, weak security headers, unsafe CORS, injection
+indicators) and produce a short overall summary plus a list of findings, each with a risk explanation and a specific
+mitigation technique. Respond with strict JSON only, matching this shape:
+{ "summary": string, "findings": [ { "issue": string, "severity": "critical"|"high"|"medium"|"low"|"info", "risk": string, "mitigation": string } ] }
+Base findings only on what the provided request/response actually shows. If nothing notable is present, return an empty findings array.`;
+
+const getAiEndpointAnalysis = async ({ request, response, checkResults }) => {
+    const cerebrasClient = require('../core/cerebrasClient');
+    const userContent = {
+        request,
+        response: {
+            status: response.status,
+            headers: response.headers,
+            body: typeof response.data === 'string'
+                ? response.data.slice(0, 4000)
+                : JSON.stringify(response.data).slice(0, 4000),
+        },
+        checkResults: checkResults.map(r => ({ check: r.check, status: r.status, message: r.message })),
+    };
+
+    return cerebrasClient.callCerebras({ systemPrompt: AI_CHECK_SYSTEM_PROMPT, userContent });
+};
+
+const printAiEndpointAnalysis = (analysis) => {
+    logger.title('\nAI Security Analysis:');
+    logger.info(analysis.summary || '(no summary returned)');
+    for (const finding of (analysis.findings || [])) {
+        logger.subTitle(`\n[${(finding.severity || 'info').toUpperCase()}] ${finding.issue}`);
+        logger.warn(`Risk: ${finding.risk}`);
+        logger.success(`Mitigation: ${finding.mitigation}`);
+    }
+};
+
+program
+    .command('check <url>')
+    .description('Run a full security check (auth, CORS, headers, injection, rate limiting, etc.) against a single live endpoint')
+    .option('-X, --method <method>', 'HTTP method to use', 'GET')
+    .option('-H, --header <header...>', 'Extra request header as "Key: Value" (repeatable)')
+    .option('-d, --data <body>', 'Request body — a JSON string, or @path/to/file.json')
+    .option('-t, --token <token>', 'Bearer token for authentication')
+    .option('-u, --username <user>', 'Username for Basic Auth')
+    .option('-p, --password <pass>', 'Password for Basic Auth')
+    .option('--auth-file <path>', 'Path to JSON file containing role:token mapping or login_endpoint config')
+    .option('-o, --output <path>', 'Path to save the check results as JSON')
+    .option('-AI, --ai', 'Send the live request/response to the AI for a risk analysis and mitigation recommendations')
+    .action(async (url, options) => {
+        try {
+            const parsedUrl = new URL(url);
+            const baseUrl = `${parsedUrl.protocol}//${parsedUrl.host}`;
+            const path = `${parsedUrl.pathname}${parsedUrl.search}`;
+            const method = options.method.toUpperCase();
+            const extraHeaders = parseHeaderList(options.header);
+            const body = parseBodyOption(options.data);
+
+            const authMap = await resolveAuthMap(options);
+            const config = {
+                base_url: baseUrl,
+                auth: authMap.default || null,
+                headers: extraHeaders,
+                endpoints: [{
+                    path,
+                    methods: [method],
+                    body,
+                    protocol: 'rest',
+                }],
+            };
+
+            logger.title(`Checking ${method} ${url}...`);
+
+            const Engine = require('../core/engine');
+            const engine = new Engine(config);
+            engine.loadChecks();
+            const results = await engine.run();
+
+            if (options.ai) {
+                try {
+                    const response = await engine.client.request({
+                        method,
+                        url: path,
+                        data: body,
+                    });
+                    const analysis = await getAiEndpointAnalysis({
+                        request: { method, url, headers: { ...extraHeaders, ...engine.context.getAuthHeaders() }, body },
+                        response,
+                        checkResults: results,
+                    });
+                    printAiEndpointAnalysis(analysis);
+                    if (options.output) results.push({ check: 'ai/endpointAnalysis', ...analysis });
+                } catch (aiErr) {
+                    logger.error(`AI analysis failed: ${aiErr.message}`);
+                }
+            }
+
+            if (options.output) {
+                const jsonReporter = require('../reporters/jsonReporter');
+                jsonReporter.generate(results, options.output);
+            }
+        } catch (err) {
+            logger.error(`Check failed: ${err.message}`);
+            process.exit(1);
+        }
+    });
+
 program.parse(process.argv);
