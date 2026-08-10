@@ -328,7 +328,9 @@ const printAiHeaderRecommendations = (analyses) => {
     }
 };
 
-const writeHeaderGradeResult = (outputPath, payload) => {
+// Shared by any standalone (non-Engine) command that saves its result as a single JSON
+// blob — `headers` and `jwt` both write arbitrary result shapes, not Engine-style results.
+const writeJsonResult = (outputPath, payload) => {
     const fs = require('node:fs');
     const path = require('node:path');
     const outPath = path.resolve(outputPath);
@@ -379,7 +381,7 @@ program
             }
 
             if (options.output) {
-                writeHeaderGradeResult(options.output, { url, finalUrl, ...result, ...(aiAnalyses ? { aiAnalyses } : {}) });
+                writeJsonResult(options.output, { url, finalUrl, ...result, ...(aiAnalyses ? { aiAnalyses } : {}) });
             }
         } catch (err) {
             logger.error(`Header grading failed: ${err.message}`);
@@ -529,6 +531,234 @@ program
             }
         } catch (err) {
             logger.error(`Check failed: ${err.message}`);
+            process.exit(1);
+        }
+    });
+
+// -----------------------------------------------------------------------------
+// `jwt` — decode a JWT, run offline header/claims analysis, construct forgery
+// attacks (alg=none, algorithm confusion, weak-secret cracking, kid injection),
+// and optionally fire the forged tokens at a live authenticated endpoint to see
+// which ones actually get through.
+// -----------------------------------------------------------------------------
+const JWT_SEVERITY_ORDER = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+
+const JWT_SEVERITY_LOG = {
+    critical: (msg) => logger.error(msg),
+    high: (msg) => logger.error(msg),
+    medium: (msg) => logger.warn(msg),
+    low: (msg) => logger.warn(msg),
+    info: (msg) => logger.info(msg),
+};
+
+const printJwtFindings = (findings) => {
+    if (findings.length === 0) {
+        logger.success('No issues found in header/claims analysis.');
+        return;
+    }
+    const sorted = [...findings].sort((a, b) => (JWT_SEVERITY_ORDER[a.severity] ?? 5) - (JWT_SEVERITY_ORDER[b.severity] ?? 5));
+    for (const f of sorted) {
+        const log = JWT_SEVERITY_LOG[f.severity] || logger.info;
+        log(`[${f.severity.toUpperCase()}] ${f.message}`);
+        if (f.recommendation) logger.info(`  → ${f.recommendation}`);
+    }
+};
+
+const printJwtForgeries = (forgeries) => {
+    logger.title('\nForged Tokens Constructed:');
+    for (const f of forgeries) {
+        logger.subTitle(`\n${f.name}`);
+        logger.info(f.description);
+        logger.info(f.token);
+    }
+};
+
+const JWT_VERDICT_LOG = {
+    accepted: (msg) => logger.error(msg),
+    inconclusive: (msg) => logger.warn(msg),
+    rejected: (msg) => logger.success(msg),
+    error: (msg) => logger.warn(msg),
+};
+
+const printJwtLiveResults = (liveResults) => {
+    logger.title('\nLive Forgery Test Results:');
+    logger.info(`Baseline — no Authorization header: ${liveResults.baseline.noAuth.status}`);
+    logger.info(`Baseline — original token: ${liveResults.baseline.originalToken.status}`);
+    for (const attempt of liveResults.attempts) {
+        const log = JWT_VERDICT_LOG[attempt.verdict.verdict] || logger.info;
+        log(`${attempt.name}: ${attempt.verdict.verdict.toUpperCase()} — ${attempt.verdict.reason}`);
+    }
+};
+
+const AI_JWT_SYSTEM_PROMPT = `You are an application security expert specializing in JWT (JSON Web Token) security.
+You are given a decoded JWT (header + payload; the raw signature is omitted), the deterministic findings already
+raised against its header/claims, and — if a live endpoint was supplied — the results of forgery attacks (alg=none,
+RS/ES/PS -> HS256 algorithm confusion, weak HMAC secret cracking, kid injection) run against it.
+
+Explain the concrete risk and a specific, actionable mitigation for each notable issue. Treat any forgery attempt
+with verdict "accepted" as a confirmed critical finding — it is a demonstrated authentication bypass, not a
+theoretical one. Do not invent findings unsupported by the provided data, and do not describe an "inconclusive" or
+"rejected" attempt as if it had succeeded.
+
+Respond with strict JSON only, matching this shape:
+{ "summary": string, "analyses": [ { "issue": string, "severity": "critical"|"high"|"medium"|"low"|"info", "risk": string, "mitigation": string } ] }`;
+
+const getAiJwtRecommendations = async ({ header, payload, findings, liveResults }) => {
+    const cerebrasClient = require('../core/cerebrasClient');
+    const userContent = {
+        header,
+        payload,
+        findings: findings.map(f => ({ id: f.id, severity: f.severity, message: f.message })),
+        liveForgeryResults: liveResults ? {
+            baseline: liveResults.baseline,
+            attempts: liveResults.attempts.map(a => ({ name: a.name, verdict: a.verdict.verdict, reason: a.verdict.reason })),
+        } : null,
+    };
+    return cerebrasClient.callCerebras({ systemPrompt: AI_JWT_SYSTEM_PROMPT, userContent });
+};
+
+const printAiJwtAnalysis = (analysis) => {
+    logger.title('\nAI Security Analysis:');
+    logger.info(analysis.summary || '(no summary returned)');
+    for (const item of (analysis.analyses || [])) {
+        logger.subTitle(`\n[${(item.severity || 'info').toUpperCase()}] ${item.issue}`);
+        logger.warn(`Risk: ${item.risk}`);
+        logger.success(`Mitigation: ${item.mitigation}`);
+    }
+};
+
+program
+    .command('jwt <token>')
+    .description('Decode a JWT and analyze it for header/claim weaknesses, then attempt forgery attacks (alg=none, algorithm confusion, weak-secret cracking, kid injection) — optionally against a live authenticated endpoint')
+    .option('-e, --endpoint <url>', 'Authenticated endpoint to test forged tokens against. Without this, forged tokens are constructed and reported but never sent anywhere.')
+    .option('-X, --method <method>', 'HTTP method to use against --endpoint', 'GET')
+    .option('-H, --header <header...>', 'Extra request header as "Key: Value" (repeatable)')
+    .option('--public-key <path>', 'Path to a PEM public key file — enables the RS/ES/PS -> HS256 algorithm-confusion attack')
+    .option('--wordlist <path>', 'Path to a newline-delimited wordlist for HMAC secret cracking (merged with the built-in common-secrets list)')
+    .option('-o, --output <path>', 'Path to save the full analysis as JSON')
+    .option('-AI, --ai', 'Include AI-generated risk analysis and mitigation recommendations')
+    .action(async (token, options) => {
+        try {
+            const fs = require('node:fs');
+            const { decode } = require('../core/jwt/jwtCodec');
+            const { analyzeHeader, analyzeClaims } = require('../core/jwt/jwtStaticAnalysis');
+            const {
+                crackHmacSecret, forgeAlgNone, forgeAlgConfusion, forgeKidInjection, forgeWithCrackedSecret,
+            } = require('../core/jwt/jwtForge');
+
+            const decoded = decode(token);
+
+            logger.title('Decoded Header:');
+            console.log(JSON.stringify(decoded.header, null, 2));
+            logger.title('\nDecoded Payload:');
+            console.log(JSON.stringify(decoded.payload, null, 2));
+
+            // 1. Static header/claims analysis
+            const findings = [...analyzeHeader(decoded.header), ...analyzeClaims(decoded.payload)];
+
+            // 2. Weak HMAC secret cracking (only applicable to HS256/384/512 tokens)
+            const builtinWordlist = require('../config/commonJwtSecrets.json');
+            let wordlist = builtinWordlist;
+            if (options.wordlist) {
+                const custom = fs.readFileSync(options.wordlist, 'utf8')
+                    .split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+                wordlist = [...new Set([...builtinWordlist, ...custom])];
+            }
+            const crackedSecret = crackHmacSecret(decoded, wordlist);
+            if (crackedSecret !== null) {
+                findings.push({
+                    id: 'JWT-HMAC-SECRET-CRACKED',
+                    severity: 'critical',
+                    field: 'signature',
+                    message: `HMAC secret cracked using a ${wordlist.length}-entry wordlist: "${crackedSecret === '' ? '(empty string)' : crackedSecret}". Anyone with this secret can forge arbitrary valid tokens.`,
+                    recommendation: 'Rotate the signing secret immediately and use a high-entropy, randomly generated secret (32+ bytes) going forward.',
+                });
+            }
+
+            logger.title('\nStatic Findings:');
+            printJwtFindings(findings);
+
+            // 3. Construct forgeries (offline — no network yet)
+            const forgeries = [...forgeAlgNone(decoded)];
+
+            let publicKeyPem = null;
+            if (options.publicKey) publicKeyPem = fs.readFileSync(options.publicKey, 'utf8');
+            const confusionForgery = forgeAlgConfusion(decoded, publicKeyPem);
+            if (confusionForgery) forgeries.push(confusionForgery);
+
+            forgeries.push(...forgeKidInjection(decoded));
+
+            if (crackedSecret !== null) {
+                forgeries.push(forgeWithCrackedSecret(decoded, crackedSecret));
+            }
+
+            printJwtForgeries(forgeries);
+
+            // 4. Live testing against a real endpoint (optional)
+            let liveResults = null;
+            if (options.endpoint) {
+                const { runLiveForgeryTests } = require('../core/jwt/jwtLiveTester');
+                const extraHeaders = parseHeaderList(options.header);
+                const method = options.method.toUpperCase();
+
+                const liveForgeries = [...forgeries];
+                if (decoded.payload.exp !== undefined && decoded.payload.exp < Math.floor(Date.now() / 1000)) {
+                    liveForgeries.push({
+                        name: 'expired-token-replay',
+                        description: 'Original token is already expired (exp in the past) — resent unmodified to check whether the server actually enforces "exp".',
+                        token,
+                    });
+                }
+
+                logger.title(`\nRunning live forgery tests against ${method} ${options.endpoint}...`);
+                liveResults = await runLiveForgeryTests({
+                    url: options.endpoint,
+                    method,
+                    headers: extraHeaders,
+                    originalToken: token,
+                    forgeries: liveForgeries,
+                });
+                printJwtLiveResults(liveResults);
+
+                for (const attempt of liveResults.attempts) {
+                    if (attempt.verdict.verdict === 'accepted') {
+                        findings.push({
+                            id: 'JWT-FORGERY-ACCEPTED',
+                            severity: 'critical',
+                            field: attempt.name,
+                            message: `Endpoint accepted a forged token via "${attempt.name}" — ${attempt.verdict.reason}`,
+                            recommendation: 'Fix the underlying verification gap for this attack class before deploying — forged tokens must be rejected.',
+                        });
+                    }
+                }
+            } else {
+                logger.info('\nNo --endpoint given — forged tokens above were constructed but not sent anywhere. Pass --endpoint <authenticated-url> to test them live.');
+            }
+
+            // 5. AI recommendations (optional)
+            let aiAnalysis = null;
+            if (options.ai) {
+                try {
+                    aiAnalysis = await getAiJwtRecommendations({ header: decoded.header, payload: decoded.payload, findings, liveResults });
+                    printAiJwtAnalysis(aiAnalysis);
+                } catch (aiErr) {
+                    logger.error(`AI analysis failed: ${aiErr.message}`);
+                }
+            }
+
+            // 6. Output
+            if (options.output) {
+                writeJsonResult(options.output, {
+                    header: decoded.header,
+                    payload: decoded.payload,
+                    findings,
+                    forgeries,
+                    liveResults,
+                    ...(aiAnalysis ? { aiAnalysis } : {}),
+                });
+            }
+        } catch (err) {
+            logger.error(`JWT analysis failed: ${err.message}`);
             process.exit(1);
         }
     });

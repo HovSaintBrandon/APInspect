@@ -347,6 +347,41 @@ apinspect check https://api.example.com/users/42 -X POST \
 
 With `--ai`, the endpoint is hit a second time and the request/response plus the deterministic check results are handed to the AI, which returns a summary and a list of findings — each with a severity, the concrete risk, and a mitigation technique — printed after the standard check output.
 
+### `apinspect jwt <token>` — JWT decode, header/claims audit, and forgery testing
+
+Decodes a bearer JWT and audits it across the header, claims, and signature — then actively tries to forge a token the server will still accept. No collection or spec file needed; just the token.
+
+```bash
+apinspect jwt <token> [options]
+```
+
+| Option | Description |
+|---|---|
+| `-e, --endpoint <url>` | Authenticated endpoint to fire forged tokens at. Without this, tokens are constructed and printed but never sent. |
+| `-X, --method <method>` | HTTP method to use against `--endpoint` (default `GET`) |
+| `-H, --header <header...>` | Extra request header as `"Key: Value"` — repeatable |
+| `--public-key <path>` | PEM public key file — enables the RS/ES/PS → HS256 algorithm-confusion attack |
+| `--wordlist <path>` | Newline-delimited wordlist for HMAC secret cracking, merged with the built-in common-secrets list |
+| `-o, --output <path>` | Write the decoded token, findings, forged tokens, and live results as JSON |
+| `-AI, --ai` | Ask the AI for a risk analysis and mitigations across everything found |
+
+What it does, in order:
+1. **Decodes** the header and payload (no verification — this is a read, not a trust decision).
+2. **Header analysis** — flags `alg: none`, unrecognized algorithms, an injectable `kid`, and SSRF-prone `jku`/`x5u`/embedded `jwk`.
+3. **Claims analysis** — flags a missing/absent `exp`, an unusually long lifetime, missing `iss`/`aud`/`jti`, and sensitive-looking data sitting in the payload (it's base64, not encrypted).
+4. **Weak-secret cracking** — for `HS256`/`384`/`512` tokens, tries the signature against a built-in common-secrets list (extendable with `--wordlist`). A hit means the token can be forged outright.
+5. **Forges tokens**: `alg=none` (signature stripped, 3 casing variants), RS/ES/PS→HS256 algorithm confusion (if `--public-key` is given), `kid` injection (path traversal / SQLi payloads), and — if the secret was cracked — a re-signed token with any recognizable privilege claim (`role`, `isAdmin`, `scope`, etc.) escalated and `exp` pushed out 10 years.
+6. **Tests live**, if `--endpoint` is given: sends each forged token, plus a no-auth and original-token baseline, and classifies each as `accepted` / `rejected` / `inconclusive` (the endpoint doesn't enforce auth at all, so nothing is attributable to the forgery).
+
+```bash
+apinspect jwt "eyJhbGciOi..." \
+  --endpoint https://api.example.com/account/profile \
+  --public-key ./keys/jwt_public.pem \
+  --ai
+```
+
+Any forged token the live test marks `accepted` is surfaced as a `critical` finding — that's a demonstrated auth bypass, not a theoretical one. With `--ai`, everything (decoded header/payload, static findings, live results) is handed to the AI for a prioritized risk summary and specific mitigations, printed after the deterministic output and included in the JSON output under `aiAnalysis` when `-o` is used.
+
 ---
 
 ## Authentication
@@ -696,8 +731,8 @@ When scanning with a multi-role `--auth-file`, per-role reports are written auto
 ```
 src/
   cli/
-    index.js                 CLI entry point (commander) — scan / audit / analyze / headers
-    authResolver.js          Shared auth-file/token/basic-auth resolution (scan + headers)
+    index.js                 CLI entry point (commander) — scan / audit / analyze / headers / check / jwt
+    authResolver.js          Shared auth-file/token/basic-auth resolution (scan + headers + check)
   core/
     parser.js                Input detection + normalization (Postman/OpenAPI/GraphQL/gRPC)
     engine.js                Main scan loop — checklist mode + legacy mode
@@ -709,6 +744,11 @@ src/
       applicabilityEngine.js  Which checklist items apply to this endpoint
       probeSynthesizer.js     Builds a context-aware attack request
       verdictClassifier.js    Judges the response, assigns confidence
+    jwt/
+      jwtCodec.js              Base64url decode/encode — raw JWT parsing, no verification
+      jwtStaticAnalysis.js     Header (alg/kid/jku/jwk) + claims (exp/aud/iss/jti) findings
+      jwtForge.js              Builds forged tokens: alg=none, alg confusion, secret cracking, kid injection
+      jwtLiveTester.js         Fires forged tokens at a live endpoint, classifies accepted/rejected/inconclusive
   adapters/
     rest/, graphql/, grpc/    Protocol-specific transport + discovery
   checks/                     Hardcoded, deterministic check modules
@@ -716,6 +756,7 @@ src/
   config/
     checklist.json            The 34-item security checklist
     securityHeaderRules.json   Header grading rule set — weights, quality checks, recommendations
+    commonJwtSecrets.json      Built-in weak-secret wordlist for `apinspect jwt` HMAC cracking
     aiConfig.js                Model + confidence threshold configuration
 eval/
   run.js                      Eval harness against a mock server + ground truth
