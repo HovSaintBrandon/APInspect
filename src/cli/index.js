@@ -13,6 +13,8 @@ const newmanRunner = require('../core/newmanRunner');
 const logger = require('../utils/logger');
 const packageJson = require('../../package.json');
 const { resolveAuthMap, authValueToHeaders } = require('./authResolver');
+const { getCallCount } = require('../core/cerebrasClient');
+const { isFail: isFailStatus, COVERAGE_GAP_STATUSES } = require('../core/statuses');
 
 const program = new Command();
 
@@ -146,6 +148,18 @@ program
                 const results = await engine.run();
                 allResults.push(...results);
 
+                if (options.checklist) {
+                    const na = results.filter(r => r.status === 'N/A').length;
+                    const applicable = results.length - na;
+                    const evaluated = results.filter(r => r.status === 'PASS' || isFailStatus(r.status)).length;
+                    const gaps = results.filter(r => COVERAGE_GAP_STATUSES.includes(r.status)).length;
+                    const coveragePct = applicable > 0 ? Math.round((evaluated / applicable) * 1000) / 10 : 0;
+                    logger.info(
+                        `[${role}] Coverage: ${evaluated}/${applicable} applicable checks evaluated (${coveragePct}%)` +
+                        (gaps > 0 ? ` — ${gaps} blocked by auth/routing/endpoint health, see report for detail.` : '.')
+                    );
+                }
+
                 // 5. Generate Report
                 let roleOutput = options.output;
                 if (roleOutput && role !== 'default' && role !== 'unauthenticated') {
@@ -170,6 +184,10 @@ program
                 }
             }
 
+            if (options.checklist) {
+                logger.info(`\nAI calls made this run: ${getCallCount()}`);
+            }
+
             // ---------------------------------------------------------------
             // CI/CD Exit Code Evaluation
             // ---------------------------------------------------------------
@@ -177,7 +195,7 @@ program
                 const failingFindings = [];
 
                 for (const r of allResults) {
-                    const isFail = r.status === 'FAIL' || r.status === 'FAILED';
+                    const isFail = isFailStatus(r.status);
                     const isWarn = r.status === 'WARN';
                     const isTbc = r.confirmation_status === 'to_be_confirmed';
                     const isActionable = isFail || isWarn;
@@ -398,12 +416,25 @@ const parseBodyOption = (data) => {
 };
 
 const AI_CHECK_SYSTEM_PROMPT = `You are an application security expert analyzing a single live HTTP request/response exchange
-captured from a manual endpoint check. Identify concrete security issues evidenced by the response (e.g. missing/weak auth
-enforcement, verbose errors or stack traces, sensitive data exposure, weak security headers, unsafe CORS, injection
-indicators) and produce a short overall summary plus a list of findings, each with a risk explanation and a specific
-mitigation technique. Respond with strict JSON only, matching this shape:
+captured from a manual endpoint check, alongside the verdicts of deterministic security checks already run against it.
+Identify concrete security issues evidenced by the response (e.g. missing/weak auth enforcement, verbose errors or stack
+traces, sensitive data exposure, weak security headers, unsafe CORS, injection indicators) and produce a short overall
+summary plus a list of findings, each with a risk explanation and a specific mitigation technique.
+
+Strict evidence rules:
+- Only report a finding as a confirmed issue if the request/response actually demonstrates it. A non-2xx response
+  (e.g. a 400 for a missing required field) is NOT evidence that authentication/authorization is missing or bypassed —
+  it only shows the request was malformed or incomplete.
+- Do not restate a check whose status is "MANUAL" or "TO BE CONFIRMED" as if it were a confirmed vulnerability — if you
+  mention it at all, keep its severity at "info" and phrase it as needing manual verification, not as a confirmed finding.
+- Do not flag "missing authentication" on an endpoint whose purpose is to authenticate (e.g. login/token/refresh
+  endpoints) — those are expected to be reachable without a prior session.
+- If the endpoint requires a request body or headers to be evaluated meaningfully and none were supplied, say so rather
+  than guessing at behavior.
+
+Respond with strict JSON only, matching this shape:
 { "summary": string, "findings": [ { "issue": string, "severity": "critical"|"high"|"medium"|"low"|"info", "risk": string, "mitigation": string } ] }
-Base findings only on what the provided request/response actually shows. If nothing notable is present, return an empty findings array.`;
+Base findings only on what the provided request/response and check results actually show. If nothing notable is present, return an empty findings array.`;
 
 const getAiEndpointAnalysis = async ({ request, response, checkResults }) => {
     const cerebrasClient = require('../core/cerebrasClient');

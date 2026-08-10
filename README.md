@@ -302,6 +302,9 @@ Follows redirects and grades the **final** destination, not the `3xx` hop. Suppo
 | `-u, --username <user>` / `-p, --password <pass>` | Basic Auth credentials |
 | `--auth-file <path>` | Same auth-file format as `scan` — see [Authentication](#authentication) (only the `default`/first role is used) |
 | `-o, --output <path>` | Write the grade + findings as JSON |
+| `-AI, --ai` | Ask the AI to explain the risk and mitigation for each missing/weak/leaking header |
+
+The grade is color-coded in the terminal, green (`A+`/`A`) fading through yellow/orange (`B`–`D`) to red (`E`/`F`), same at-a-glance read as securityheaders.com.
 
 Example output:
 
@@ -312,6 +315,37 @@ Grade: B  (69/100)
 ⚠ Permissions-Policy: missing. → Add a Permissions-Policy restricting sensitive features, e.g. geolocation=(), camera=(), microphone=()
 ⚠ Server: discloses server implementation details. → Remove or generalize the Server header
 ```
+
+With `--ai`, each weak/missing/leaking header additionally gets an AI-generated **Risk** and **Mitigation** writeup, appended to the JSON output under `aiAnalyses` when `-o` is used.
+
+### `apinspect check <url>` — full check sweep against a single live endpoint
+
+Runs the same hardcoded check suite as `scan` (discovery, HTTP method fuzzing, auth enforcement, CORS, security headers, sensitive data exposure, stack traces, rate limiting, SQLi/XSS and path-traversal fuzzing) against **one** endpoint — no Postman collection, OpenAPI spec, or discovery step required. Pass everything the request needs directly on the command line.
+
+```bash
+apinspect check <url> [options]
+```
+
+| Option | Description |
+|---|---|
+| `-X, --method <method>` | HTTP method to use (default `GET`) |
+| `-H, --header <header...>` | Extra request header as `"Key: Value"` — repeatable |
+| `-d, --data <body>` | Request body — a JSON string, or `@path/to/file.json` |
+| `-t, --token <token>` | Bearer token for authentication |
+| `-u, --username <user>` / `-p, --password <pass>` | Basic Auth credentials |
+| `--auth-file <path>` | Same auth-file format as `scan` — see [Authentication](#authentication) (only the `default`/first role is used) |
+| `-o, --output <path>` | Write check results (and AI findings, if `--ai`) as JSON |
+| `-AI, --ai` | Send the live request/response and check results to the AI for an overall risk summary and mitigations |
+
+```bash
+apinspect check https://api.example.com/users/42 -X POST \
+  -H "X-Api-Version: 2" \
+  -d '{"name":"test"}' \
+  -t "eyJhbGciOi..." \
+  --ai
+```
+
+With `--ai`, the endpoint is hit a second time and the request/response plus the deterministic check results are handed to the AI, which returns a summary and a list of findings — each with a severity, the concrete risk, and a mitigation technique — printed after the standard check output.
 
 ---
 
@@ -637,7 +671,7 @@ The contract is the same everywhere: install Node, `npm ci`, set `CEREBRAS_API_K
 | `0` | Scan completed; no finding met the `--fail-on` threshold (or `--fail-on` wasn't set) |
 | `1` | A confirmed finding (or, with `--fail-on-tbc`, a `TO BE CONFIRMED` finding) met or exceeded the `--fail-on` severity — or a non-infrastructure runtime error occurred |
 | `2` | Invalid CLI arguments (bad `--fail-on`/`--style` value, or `--fail-on-tbc` used without `--fail-on`) |
-| `3` | Infrastructure failure — e.g. the AI backend was unreachable or returned a billing/auth error mid-scan. Partial results are still written to a `.partial.json` file, but **must not be used for gating** — treat as inconclusive, not passing. |
+| `3` | Infrastructure failure — e.g. the AI backend was unreachable or returned a billing/auth error mid-scan, or the preflight check found every REST endpoint in the collection returning 404 (almost always a wrong `--base-url` or an unresolved path template). Partial results are still written to a `.partial.json` file, but **must not be used for gating** — treat as inconclusive, not passing. |
 
 ---
 
@@ -649,7 +683,9 @@ The contract is the same everywhere: install Node, `npm ci`, set `CEREBRAS_API_K
 | CSV | `-o report.csv` | Spreadsheet-friendly flat export |
 | FALCON review | `-o report.falcon.csv` | Purpose-built triage spreadsheet — grouped by severity/category for manual review sign-off |
 
-Each result includes `check`, `endpoint`, `method`, `status`, `severity`, `confirmation_status`, `message`, and — for AI-driven checks — `ai_confidence`, `ai_reasoning`, `evidence_cited`, and a full `evidence_trail` (request/response pair) for auditability.
+Each result includes `check`, `endpoint`, `method`, `status`, `severity`, `confirmation_status`, `message`, a full `evidence_trail` (request/response pair, whenever a request was actually sent — hardcoded checks and AI-driven ones alike) for auditability, and — for AI-driven checks specifically — `ai_confidence`, `ai_reasoning`, `evidence_cited`.
+
+`status` is one of: `PASS`, `FAIL`, `N/A` (genuinely not applicable to this endpoint/protocol), `MANUAL` / `TO BE CONFIRMED` (a real evaluation was attempted but needs human judgment), or a coverage-gap status — `AUTH_BLOCKED` (request was stopped by a 401/403 before the check under test could run), `ROUTE_NOT_FOUND` (404 — no route matched, so nothing about the endpoint could be evaluated), `ENDPOINT_UNHEALTHY` (a baseline request 5xx'd, so dependent checks were skipped as unreliable), or `UNRESOLVED_PATH` (the spec's path template never resolved to a real URL, so no request was sent at all). Coverage-gap statuses are never folded into `PASS`/`N/A` — the JSON report's `summary` block breaks them out individually plus a `coverage.coverage_pct` (evaluated ÷ applicable), so a high pass count can't quietly hide low real coverage.
 
 When scanning with a multi-role `--auth-file`, per-role reports are written automatically (e.g. `report.student.json`, `report.admin.json`) alongside the combined run.
 

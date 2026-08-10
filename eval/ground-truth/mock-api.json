@@ -20,7 +20,7 @@
       "endpoint": "/api/users/export",
       "method": "GET",
       "check_id": "DATA-01",
-      "expected_verdict": "FAILED",
+      "expected_verdict": "FAIL",
       "notes": "Exposes SSN and JWT. Hardcoded regex check detects sensitive data — confirmed FAIL at High severity."
     },
     {

@@ -39,6 +39,7 @@
     "test_name": "Verify that authentication tokens are validated server-side and not merely checked client-side.",
     "maps_to_check": null,
     "requires_ai_probe": true,
+    "requires_auth_session": true,
     "applies_to": [
       "rest"
     ]
@@ -50,6 +51,7 @@
     "test_name": "Test for broken object-level authorization — access another user's objects by manipulating IDs.",
     "maps_to_check": null,
     "requires_ai_probe": true,
+    "requires_auth_session": true,
     "applies_to": [
       "rest"
     ]
@@ -116,6 +118,7 @@
     "test_name": "Verify that responses do not return excessive data fields beyond what the client requested.",
     "maps_to_check": null,
     "requires_ai_probe": true,
+    "requires_auth_session": true,
     "applies_to": [
       "rest"
     ]
@@ -182,6 +185,7 @@
     "test_name": "Test for mass assignment vulnerabilities by sending unexpected or privileged parameters in request bodies.",
     "maps_to_check": null,
     "requires_ai_probe": true,
+    "requires_auth_session": true,
     "applies_to": [
       "rest"
     ]
@@ -193,6 +197,7 @@
     "test_name": "Verify that write operations reject or ignore unexpected fields not in the API schema.",
     "maps_to_check": null,
     "requires_ai_probe": true,
+    "requires_auth_session": true,
     "applies_to": [
       "rest"
     ]

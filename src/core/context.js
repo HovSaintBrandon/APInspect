@@ -67,13 +67,42 @@ class Context {
     resolveString(input) {
         if (!input || typeof input !== 'string') return input;
         return input.replace(/\{\{([^}]+)\}\}/g, (match, varName) => {
+            // {{base_url}} / {{baseUrl}} are not harvested variables — they're the
+            // spec's own way of spelling "the host, which axios's baseURL already
+            // supplies separately." Resolving them to the actual base URL string
+            // would double it up inside a path (baseURL + "/https://host/api/...");
+            // the correct resolution is to drop them, same as the Postman-specific
+            // {{baseUrl}} stripping this generalizes.
+            if (varName === 'base_url' || varName === 'baseUrl') {
+                return '';
+            }
             const value = this.store[varName];
             if (value === undefined) {
                 // If the variable isn't in our store, return the original {{match}}
-                return match; 
+                return match;
             }
             return value;
         });
+    }
+
+    /**
+     * The one shared routine for turning a spec's raw endpoint path into
+     * something safe to request — every check (hardcoded or AI-probe) and the
+     * discovery/harvesting phase must go through this, not resolveString directly,
+     * so they can never disagree about what a given endpoint's real URL is.
+     * Also collapses accidental "//" left behind by stripping {{base_url}} out of
+     * a path that already had its own leading slash (e.g. "/{{base_url}}/api/x").
+     */
+    resolvePath(rawPath) {
+        const resolved = this.resolveString(rawPath);
+        if (typeof resolved !== 'string') return resolved;
+        return resolved.replace(/\/{2,}/g, '/');
+    }
+
+    /** True if the path still has an unresolved {{var}} after resolvePath(). */
+    hasUnresolvedVariables(rawPath) {
+        const resolved = this.resolvePath(rawPath);
+        return typeof resolved === 'string' && /\{\{[^}]+\}\}/.test(resolved);
     }
 }
 

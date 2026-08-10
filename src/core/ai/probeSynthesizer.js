@@ -56,10 +56,17 @@ Respond ONLY with valid JSON matching ONE of these exact shapes:
  * @param {object} checklistItem - { id, category, test_name, requires_ai_probe }
  * @param {object} endpoint      - { path, methods, originalName? }
  * @param {AICache|null} cache   - optional persistent cache instance
+ * @param {string|null} resolvedPath - the endpoint's path with {{var}} templates
+ *   already resolved (real harvested IDs baked in). Used only for what the model
+ *   sees, never for cache keys — cache.getProbe/setProbe still hash the endpoint's
+ *   original template path so a harvested ID changing between runs doesn't
+ *   invalidate the cache. Passing this means the model reuses the SAME concrete
+ *   value the deterministic engine already resolved instead of inventing its own
+ *   (which is how the two engines used to end up testing two different URLs).
  * @returns {Promise<object|null>} probe spec or null if incompatible
  * @throws {InfrastructureError} if Cerebras is unreachable after retries
  */
-async function synthesizeProbe(checklistItem, endpoint, cache = null) {
+async function synthesizeProbe(checklistItem, endpoint, cache = null, resolvedPath = null) {
     const method = (endpoint.methods && endpoint.methods[0]) || 'GET';
 
     // Check persistent cache first
@@ -79,7 +86,7 @@ async function synthesizeProbe(checklistItem, endpoint, cache = null) {
         },
         endpoint_context: `<endpoint_context>\n${JSON.stringify({
             method,
-            path: endpoint.path,
+            path: resolvedPath || endpoint.path,
             name: endpoint.originalName || null,
         })}\n</endpoint_context>`,
     };

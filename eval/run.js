@@ -100,10 +100,10 @@ async function runEval() {
             if (majorityVerdict === 'TO BE CONFIRMED' || majorityVerdict === 'MANUAL') {
                 tbcCount++;
                 outcome = "TBC";
-            } else if (majorityVerdict === 'PASS' && expected === 'FAILED') {
+            } else if (majorityVerdict === 'PASS' && expected === 'FAIL') {
                 falseNegatives++;
                 outcome = "FALSE NEGATIVE";
-            } else if (majorityVerdict === 'FAILED' && expected === 'PASS') {
+            } else if (majorityVerdict === 'FAIL' && expected === 'PASS') {
                 falsePositives++;
                 outcome = "FALSE POSITIVE";
             }

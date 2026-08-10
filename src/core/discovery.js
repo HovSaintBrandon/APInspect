@@ -10,22 +10,25 @@ const toSingular = (word) => {
 };
 
 /**
- * Runs the initial discovery phase to harvest IDs and populate the Context Variable Store.
- * @param {Context} context - The APInspect context object
- * @param {AxiosInstance} client - The configured HTTP client
+ * One pass over every GET list-endpoint, harvesting one variable per endpoint
+ * whose path is already fully resolved. Factored out of runDiscovery so it can
+ * be repeated — a nested resource like /bookings/{{booking_id}}/sessions can't
+ * be pinged until booking_id exists, which only happens once /bookings itself
+ * has been harvested, so a single pass is order-dependent on how the spec lists
+ * endpoints. Re-running until nothing new shows up removes that dependency.
+ * @returns {Promise<number>} variables harvested this pass
  */
-const runDiscovery = async (context, client) => {
-    logger.title('Phase 1: Discovery & Variable Harvesting');
+const _harvestPass = async (context, client) => {
     let harvestedCount = 0;
 
     for (const endpoint of context.endpoints) {
         // We only want to execute safe GET requests to list endpoints
         if (!endpoint.methods.includes('GET')) continue;
 
-        const resolvedPath = context.resolveString(endpoint.path);
+        const resolvedPath = context.resolvePath(endpoint.path);
 
         // If the path STILL contains unresolved variables (e.g., {{id}}), we can't hit it yet.
-        // It's a detail endpoint, not a list endpoint.
+        // It's a detail endpoint, not a list endpoint — maybe next pass.
         if (resolvedPath.includes('{{')) {
             continue;
         }
@@ -82,10 +85,34 @@ const runDiscovery = async (context, client) => {
         }
     }
 
-    if (harvestedCount === 0) {
+    return harvestedCount;
+};
+
+// Bounded rather than "until convergence" — a spec with a genuine circular
+// reference (A needs B's id, B needs A's id) would otherwise loop until every
+// pass harvests 0, which it always eventually does, so this cap just bounds
+// how many endpoint-deep a resolution chain can be before we give up.
+const MAX_PASSES = 5;
+
+/**
+ * Runs the initial discovery phase to harvest IDs and populate the Context Variable Store.
+ * @param {Context} context - The APInspect context object
+ * @param {AxiosInstance} client - The configured HTTP client
+ */
+const runDiscovery = async (context, client) => {
+    logger.title('Phase 1: Discovery & Variable Harvesting');
+    let totalHarvested = 0;
+
+    for (let pass = 0; pass < MAX_PASSES; pass++) {
+        const harvestedThisPass = await _harvestPass(context, client);
+        totalHarvested += harvestedThisPass;
+        if (harvestedThisPass === 0) break;
+    }
+
+    if (totalHarvested === 0) {
         logger.info('[Discovery] No new variables were harvested.');
     } else {
-        logger.info(`[Discovery] Successfully populated ${harvestedCount} variables into the Context Store.`);
+        logger.info(`[Discovery] Successfully populated ${totalHarvested} variable(s) into the Context Store.`);
     }
 };
 

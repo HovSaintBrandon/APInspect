@@ -104,6 +104,29 @@ const normalizeEndpoints = (endpoints) => endpoints.map(ep => ({
     methods: ep.methods.map(m => m.toUpperCase()),
 }));
 
+// Postman collections in particular routinely list the same (method, path) more than
+// once — the same request duplicated across a "happy path" folder and a "negative tests"
+// folder, for example. Each duplicate re-spends a full applicability + probe + classify
+// pass per checklist item for zero additional coverage, so collapse to one entry per
+// (method, path) right after parsing, before the engine ever sees the endpoint list.
+const dedupeEndpoints = (endpoints) => {
+    const seen = new Map();
+    let dropped = 0;
+    for (const ep of endpoints) {
+        const method = (ep.methods?.[0] || 'GET').toUpperCase();
+        const key = `${method} ${ep.path}`;
+        if (seen.has(key)) {
+            dropped++;
+        } else {
+            seen.set(key, ep);
+        }
+    }
+    if (dropped > 0) {
+        logger.info(`Deduplicated ${dropped} duplicate endpoint(s) (same method + path listed more than once).`);
+    }
+    return Array.from(seen.values());
+};
+
 // Ambiguous inputs (Postman collections, OpenAPI/Swagger specs, raw internal JSON) could
 // describe a REST API or a single GraphQL endpoint fronted by REST-shaped tooling — the file
 // extension alone doesn't tell us. Unambiguous inputs (.graphql/.gql, .proto, a live GraphQL
@@ -134,7 +157,7 @@ const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
             return {
                 base_url: discovered.base_url,
                 protocol: discovered.protocol,
-                endpoints: normalizeEndpoints(discovered.endpoints),
+                endpoints: dedupeEndpoints(normalizeEndpoints(discovered.endpoints)),
             };
         }
 
@@ -152,7 +175,7 @@ const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
             return {
                 base_url: discovered.base_url,
                 protocol: discovered.protocol,
-                endpoints: normalizeEndpoints(discovered.endpoints),
+                endpoints: dedupeEndpoints(normalizeEndpoints(discovered.endpoints)),
             };
         }
 
@@ -163,7 +186,7 @@ const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
             return {
                 base_url: discovered.base_url,
                 protocol: discovered.protocol,
-                endpoints: normalizeEndpoints(discovered.endpoints),
+                endpoints: dedupeEndpoints(normalizeEndpoints(discovered.endpoints)),
                 meta: discovered.meta,
             };
         }
@@ -195,7 +218,7 @@ const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
             return {
                 base_url: discovered.base_url,
                 protocol: style,
-                endpoints: normalizeEndpoints(discovered.endpoints).map(ep => ({ ...ep, protocol: style })),
+                endpoints: dedupeEndpoints(normalizeEndpoints(discovered.endpoints).map(ep => ({ ...ep, protocol: style }))),
             };
         }
 
@@ -255,14 +278,14 @@ const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
         }
 
         // Normalize endpoints
-        config.endpoints = config.endpoints.map(ep => ({
+        config.endpoints = dedupeEndpoints(config.endpoints.map(ep => ({
             ...ep,
             path: ep.path.startsWith('/') ? ep.path : `/${ep.path}`,
             methods: ep.methods ? ep.methods.map(m => m.toUpperCase()) : ['GET'],
             protocol: ep.protocol || config.protocol,
             // Internal JSON specs may name the sample request payload `body` or `payload`.
             body: ep.body || ep.payload || null,
-        }));
+        })));
 
         return config;
 

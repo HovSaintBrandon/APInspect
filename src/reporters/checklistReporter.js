@@ -17,6 +17,7 @@ const fs   = require('fs');
 const path = require('path');
 const logger = require('../utils/logger');
 const checklist = require('../config/checklist.json');
+const { isFail, isCoverageGap } = require('../core/statuses');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -32,7 +33,12 @@ const escapeCsv = (str) => {
 
 const rowToCsv = (...fields) => fields.map(escapeCsv).join(',');
 
-// Translate between internal status codes and FALCON vocabulary
+// Translate between internal status codes and FALCON vocabulary. The FALCON
+// spreadsheet format is a fixed 4-value enum for reviewers, so the coverage-gap
+// statuses (AUTH_BLOCKED, ROUTE_NOT_FOUND, ENDPOINT_UNHEALTHY, UNRESOLVED_PATH)
+// fold into TO BE CONFIRMED here — but buildComment() below always carries the
+// specific reason into the Comments column, so the distinction isn't lost, just
+// not given its own spreadsheet column.
 const toFalconVerdict = (status) => {
     const map = {
         'PASS':             'PASS',
@@ -42,7 +48,9 @@ const toFalconVerdict = (status) => {
         'MANUAL':           'TO BE CONFIRMED',
         'TO BE CONFIRMED':  'TO BE CONFIRMED',
     };
-    return map[status] || 'TO BE CONFIRMED';
+    if (map[status]) return map[status];
+    if (isFail(status)) return 'FAILED';
+    return 'TO BE CONFIRMED';
 };
 
 // Build a human-readable comment from the result fields
@@ -89,7 +97,12 @@ const generate = (results, outputPath) => {
                     resultsByItemId.set(key, result);
                 } else {
                     const existing = resultsByItemId.get(key);
-                    const priority = { 'FAILED': 4, 'FAIL': 4, 'TO BE CONFIRMED': 3, 'MANUAL': 3, 'PASS': 2, 'N/A': 1 };
+                    const priority = {
+                        'FAILED': 4, 'FAIL': 4,
+                        'TO BE CONFIRMED': 3, 'MANUAL': 3,
+                        'AUTH_BLOCKED': 3, 'ROUTE_NOT_FOUND': 3, 'ENDPOINT_UNHEALTHY': 3, 'UNRESOLVED_PATH': 3,
+                        'PASS': 2, 'N/A': 1,
+                    };
                     if ((priority[result.status] || 0) > (priority[existing.status] || 0)) {
                         resultsByItemId.set(key, result);
                     }
@@ -146,16 +159,16 @@ const generate = (results, outputPath) => {
         }
 
         // Add a summary block at the top
-        const totalItems  = rows.length - 1; // Subtract header
         const passCount   = results.filter(r => r.status === 'PASS').length;
-        const failCount   = results.filter(r => r.status === 'FAIL' || r.status === 'FAILED').length;
+        const failCount   = results.filter(r => isFail(r.status)).length;
         const tbcCount    = results.filter(r => r.status === 'MANUAL' || r.status === 'TO BE CONFIRMED').length;
         const naCount     = results.filter(r => r.status === 'N/A').length;
+        const gapCount    = results.filter(r => isCoverageGap(r.status)).length;
 
         const summaryRows = [
             `# APInspect FALCON Review Report`,
             `# Generated: ${new Date().toISOString()}`,
-            `# Total results: ${results.length} | PASS: ${passCount} | FAILED: ${failCount} | TO BE CONFIRMED: ${tbcCount} | N/A: ${naCount}`,
+            `# Total results: ${results.length} | PASS: ${passCount} | FAILED: ${failCount} | TO BE CONFIRMED: ${tbcCount} | N/A: ${naCount} | COVERAGE GAPS (auth-blocked/route-not-found/unhealthy/unresolved — folded into TO BE CONFIRMED above, see Comments): ${gapCount}`,
             '',
             ...rows,
         ];
@@ -167,7 +180,7 @@ const generate = (results, outputPath) => {
 
         fs.writeFileSync(reportPath, csvContent);
         logger.success(`FALCON Checklist Report saved to ${reportPath}`);
-        logger.info(`  PASS: ${passCount} | FAILED: ${failCount} | TO BE CONFIRMED: ${tbcCount} | N/A: ${naCount}`);
+        logger.info(`  PASS: ${passCount} | FAILED: ${failCount} | TO BE CONFIRMED: ${tbcCount} | N/A: ${naCount} | Coverage gaps: ${gapCount}`);
 
     } catch (err) {
         logger.error(`Failed to generate FALCON checklist report: ${err.message}`);

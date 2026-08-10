@@ -4,6 +4,13 @@ const path = require('path');
 const logger = require('../../utils/logger');
 const packageJson = require('../../../package.json');
 const aiConfig = require('../../config/aiConfig');
+const checklist = require('../../config/checklist.json');
+
+// Content hash of checklist.json, not a hand-maintained version string — so editing
+// any check's id/category/test_name/maps_to_check/etc. invalidates every cached
+// applicability decision and probe spec automatically. A hand-bumped "1.0" would
+// silently keep serving stale AI decisions built against the old checklist.
+const CHECKLIST_HASH = crypto.createHash('sha256').update(JSON.stringify(checklist)).digest('hex').substring(0, 16);
 
 class AICache {
     constructor(cacheFilePath) {
@@ -12,7 +19,7 @@ class AICache {
         this.cache = {
             metadata: {
                 model: aiConfig.AI_MODEL,
-                checklist_version: "1.0", // Hardcoded for now, could load from checklist.json
+                checklist_version: CHECKLIST_HASH,
                 apinspect_version: packageJson.version
             },
             endpoints: {}
@@ -34,8 +41,7 @@ class AICache {
             const raw = JSON.parse(fs.readFileSync(this.cacheFilePath, 'utf-8'));
             
             // Validate metadata
-            if (!raw.metadata || 
-                raw.metadata.model !== this.cache.metadata.model ||
+            if (raw.metadata?.model !== this.cache.metadata.model ||
                 raw.metadata.checklist_version !== this.cache.metadata.checklist_version ||
                 raw.metadata.apinspect_version !== this.cache.metadata.apinspect_version) {
                 logger.warn('Cache metadata mismatch (version/model changed). Invalidating entire cache.');
@@ -97,7 +103,7 @@ class AICache {
         if (!this.isActive) return null;
         const key = this._getEndpointKey(endpoint);
         const entry = this.cache.endpoints[key];
-        return (entry && entry.probes) ? entry.probes[checklistId] : null;
+        return entry?.probes ? entry.probes[checklistId] : null;
     }
 
     setProbe(endpoint, checklistId, probeSpec) {

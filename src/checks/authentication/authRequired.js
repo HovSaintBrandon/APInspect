@@ -53,6 +53,18 @@ module.exports = async (context, client, endpoint) => {
             };
         }
 
+        if (status === 404) {
+            // No route matched at all — this is not evidence about auth either way.
+            // A 404 must never be read as "access denied" (false PASS) or as
+            // "no 401 seen" (false unauthenticated-access FAIL); it means the
+            // request never reached the endpoint's code.
+            return {
+                status: 'ROUTE_NOT_FOUND',
+                message: `No route matched for ${method} ${endpoint.path} (404) — cannot evaluate auth enforcement. Check the resolved path (see discovery/endpointDiscovery) before trusting any other result for this endpoint.`,
+                details: { status }
+            };
+        }
+
         return {
             status: 'MANUAL',
             message: `Endpoint returned ${status} without auth. Needs manual verification.`,
@@ -68,8 +80,14 @@ module.exports = async (context, client, endpoint) => {
                     message: `Endpoint ${endpoint.methods[0]} ${endpoint.path} correctly blocked unauthenticated access (Status: ${status}).`,
                     details: { status }
                 };
+            } else if (status === 404) {
+                return {
+                    status: 'ROUTE_NOT_FOUND',
+                    message: `No route matched for ${endpoint.methods[0]} ${endpoint.path} (404) — cannot evaluate auth enforcement.`,
+                    details: { status }
+                };
             } else {
-                // It failed for another reason (404, 400, 500), so we can't be sure about auth
+                // It failed for another reason (400, 500), so we can't be sure about auth
                 return {
                     status: 'MANUAL',
                     message: `Endpoint returned ${status} without auth. Needs manual verification.`,

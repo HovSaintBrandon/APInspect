@@ -16,7 +16,7 @@ module.exports = async (context, client, endpoint) => {
         if (allowOrigin === '*') {
             return {
                 status: 'FAIL',
-                message: 'CORS: Access-Control-Allow-Origin is set to wildscard (*). Public access allowed.',
+                message: 'CORS: Access-Control-Allow-Origin is set to wildcard (*). Public access allowed.',
                 details: { header: allowOrigin }
             };
         }
