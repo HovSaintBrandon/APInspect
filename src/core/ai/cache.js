@@ -99,11 +99,18 @@ class AICache {
         this.isDirty = true;
     }
 
+    // Returns `undefined` when this item has never been decided (cache miss — go
+    // compute it), or the cached decision otherwise: `null` means "decided not
+    // applicable", an object is a cached probe spec. Must NOT collapse "miss" and
+    // "cached null" to the same value — a naive `entry.probes[checklistId]` index
+    // returns `undefined` for a genuinely-untouched key but the caller can't tell
+    // that apart from a deliberately-cached `null` without checking key presence.
     getProbe(endpoint, checklistId) {
-        if (!this.isActive) return null;
+        if (!this.isActive) return undefined;
         const key = this._getEndpointKey(endpoint);
         const entry = this.cache.endpoints[key];
-        return entry?.probes ? entry.probes[checklistId] : null;
+        if (!entry?.probes || !(checklistId in entry.probes)) return undefined;
+        return entry.probes[checklistId];
     }
 
     setProbe(endpoint, checklistId, probeSpec) {

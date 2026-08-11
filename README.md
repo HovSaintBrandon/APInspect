@@ -65,7 +65,7 @@ The result is a per-endpoint, per-check report you can read as a checklist, gate
    - Checklist items whose `applies_to` doesn't match the resolved protocol are excluded immediately (no wasted AI calls).
    - The **Applicability Engine** asks the model, in one batched call per endpoint, which of the remaining items are relevant.
    - Items mapped to a hardcoded module (`maps_to_check`) run deterministically.
-   - Items requiring judgment (`requires_ai_probe`) go through the **Probe Synthesizer** (builds a context-aware HTTP request) and then the **Verdict Classifier** (judges the response, cites evidence, assigns confidence).
+   - Items requiring judgment (`requires_ai_probe`) go through the **Probe Synthesizer** — one batched call building a context-aware HTTP request for every such item on the endpoint at once — then, after each request actually fires, the **Verdict Classifier** judges all the surviving responses in one more batched call (cites evidence, assigns confidence). Both stages batch per endpoint the same way applicability does, so a full endpoint costs roughly 3 AI calls total instead of up to 1 + 2×(items requiring judgment).
 5. **Report** — every result (`PASS` / `FAIL` / `WARN` / `N/A` / `MANUAL` / `TO BE CONFIRMED`) is written out with severity, category, and — for AI-driven checks — the full evidence trail (request, response, reasoning).
 
 If the multi-role auth flow is used, the entire cycle above repeats once per role (e.g. `student`, `admin`), so you get a same-endpoint comparison across privilege levels for free.

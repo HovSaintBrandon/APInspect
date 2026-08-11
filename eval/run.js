@@ -53,6 +53,7 @@ async function runEval() {
                 path.join(__dirname, '../src/cli/index.js'),
                 'scan', configPath,
                 '--checklist',
+                '--style', 'rest',
                 '-o', outPath
             ]);
 
@@ -123,6 +124,7 @@ async function runEval() {
             path.join(__dirname, '../src/cli/index.js'),
             'scan', configPath,
             '--checklist',
+            '--style', 'rest',
             '--fail-on', 'high',
             '-o', path.join(__dirname, 'results-failon.json')
         ]);
@@ -134,6 +136,7 @@ async function runEval() {
             path.join(__dirname, '../src/cli/index.js'),
             'scan', configPath,
             '--checklist',
+            '--style', 'rest',
             '--fail-on-tbc'
         ]);
         const test2Pass = exitCodeTbcAlone === 2;
@@ -144,6 +147,7 @@ async function runEval() {
             path.join(__dirname, '../src/cli/index.js'),
             'scan', configPath,
             '--checklist',
+            '--style', 'rest',
             '--fail-on', 'critical',
             '-o', path.join(__dirname, 'results-failon-crit.json')
         ]);
@@ -155,6 +159,7 @@ async function runEval() {
             path.join(__dirname, '../src/cli/index.js'),
             'scan', configPath,
             '--checklist',
+            '--style', 'rest',
             '--fail-on', 'critical',
             '--fail-on-tbc',
             '-o', path.join(__dirname, 'results-failon-crit-tbc.json')

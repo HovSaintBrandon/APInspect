@@ -11,6 +11,29 @@ const base64UrlEncode = (buf) => {
     return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 };
 
+// Every standard JWT segment decodes to a JSON object opening with `{"<lowercase-letter>`
+// (alg/typ/kid, or exp/iat/sub/iss/...). That fixes the base64url encoding of its first
+// 3 output characters to "eyJ" — reliably enough that a segment lacking that prefix is
+// almost always a truncated/off-by-one paste (e.g. grabbing the substring after "Bearer "
+// but starting one character too late), not a JSON syntax problem worth reporting as one.
+const looksTruncated = (segment) => !segment.startsWith('eyJ');
+
+const parseSegment = (segmentB64, label) => {
+    try {
+        return JSON.parse(base64UrlDecode(segmentB64).toString('utf8'));
+    } catch (e) {
+        if (looksTruncated(segmentB64)) {
+            throw new Error(
+                `${label} segment doesn't start with "eyJ" (got "${segmentB64.slice(0, 6)}..."). ` +
+                'Every JWT header/payload decodes from a JSON object, which always base64url-encodes to a leading "eyJ" — ' +
+                'this token is very likely missing a leading character (a common paste mistake, e.g. copying from ' +
+                '"Bearer eyJ..." starting one character too late). Re-copy the full token and try again.'
+            );
+        }
+        throw new Error(`Failed to parse JWT ${label.toLowerCase()} as JSON: ${e.message}`);
+    }
+};
+
 /**
  * Split and parse a JWT into its header/payload/signature, without verifying anything.
  * @throws {Error} if the token isn't 3 dot-separated segments, or header/payload aren't JSON.
@@ -22,19 +45,8 @@ const decode = (token) => {
     }
     const [headerB64, payloadB64, signatureB64] = parts;
 
-    let header;
-    try {
-        header = JSON.parse(base64UrlDecode(headerB64).toString('utf8'));
-    } catch (e) {
-        throw new Error(`Failed to parse JWT header as JSON: ${e.message}`);
-    }
-
-    let payload;
-    try {
-        payload = JSON.parse(base64UrlDecode(payloadB64).toString('utf8'));
-    } catch (e) {
-        throw new Error(`Failed to parse JWT payload as JSON: ${e.message}`);
-    }
+    const header = parseSegment(headerB64, 'Header');
+    const payload = parseSegment(payloadB64, 'Payload');
 
     return {
         header,

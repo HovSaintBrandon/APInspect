@@ -9,9 +9,9 @@ const { isFail } = require('./statuses');
 // Checklist-driven AI layer
 // ---------------------------------------------------------------------------
 const checklist = require('../config/checklist.json');
-const { getApplicableItems } = require('./ai/applicabilityEngine');
-const { synthesizeProbe }    = require('./ai/probeSynthesizer');
-const { classifyVerdict }    = require('./ai/verdictClassifier');
+const { getApplicableItems }    = require('./ai/applicabilityEngine');
+const { synthesizeProbesBatch } = require('./ai/probeSynthesizer');
+const { classifyVerdictsBatch } = require('./ai/verdictClassifier');
 
 // Build a severity lookup from checklist IDs
 const _checklistSeverityMap = {};
@@ -268,31 +268,19 @@ class Engine {
     }
 
     // -------------------------------------------------------------------------
-    // Execute an AI-synthesized probe (new path)
+    // Execute one already-synthesized probe's HTTP request and apply the
+    // deterministic short-circuit gates (404/401/403) — same logic the old
+    // per-item _runAiProbe used, just split out so it can run per item while
+    // synthesis and classification batch across the whole endpoint around it.
+    //
+    // Returns { classify: false } once it has added a final result itself
+    // (ROUTE_NOT_FOUND / AUTH_BLOCKED / a request-execution error), or
+    // { classify: true, checklistItem, probeSpec, httpResponse } for the
+    // caller to batch into one classifyVerdictsBatch call afterwards.
     // -------------------------------------------------------------------------
-    async _runAiProbe(checklistItem, endpoint, resolvedPath) {
+    async _executeProbeAndGate(checklistItem, endpoint, probeSpec) {
         const checkName = `checklist/${checklistItem.id}`;
 
-        // 1. Synthesize probe spec (cache-aware, throws InfrastructureError if AI unreachable).
-        // The prompt is given the already-resolved path (real harvested IDs baked in) so the
-        // AI isn't left to invent its own concrete value for {{booking_id}}-style variables —
-        // inventing one independently is exactly how the AI-probe engine and the deterministic
-        // engine ended up testing two different URLs for "the same" endpoint. The cache key
-        // still hashes the endpoint's original template path (see cache.js), so a harvested ID
-        // changing between runs doesn't invalidate cached applicability/probe decisions.
-        const probeSpec = await synthesizeProbe(checklistItem, endpoint, this._cache, resolvedPath);
-
-        if (!probeSpec) {
-            // Synthesizer returned null — incompatible combo, emit N/A
-            this.context.addResult(this._normalizeResult(checkName, endpoint, {
-                status:  'N/A',
-                message: `Probe synthesis determined this test is not applicable to ${endpoint.path}.`,
-            }));
-            logger.info(`[N/A] ${checkName}: Not applicable to ${endpoint.path}`);
-            return;
-        }
-
-        // 2. Execute probe via the shared HTTP client
         let httpResponse;
         try {
             httpResponse = await this.client.request({
@@ -308,10 +296,10 @@ class Engine {
                 status:  'TO BE CONFIRMED',
                 message: `Probe execution error: ${err.message}`,
             }));
-            return;
+            return { classify: false };
         }
 
-        // 3. Deterministic short-circuits — decide these from the raw HTTP artifacts
+        // Deterministic short-circuits — decide these from the raw HTTP artifacts
         // before ever asking the AI to classify them, so the verdict for "the request
         // never reached the code under test" doesn't depend on what the AI would have
         // guessed (that dependency is exactly what caused the same 401 to come back as
@@ -323,7 +311,7 @@ class Engine {
                 evidence_trail: this._buildProbeEvidenceTrail(probeSpec, httpResponse),
             }));
             logger.warn(`[ROUTE_NOT_FOUND] ${checkName}: ${probeSpec.method} ${probeSpec.path} → 404`);
-            return;
+            return { classify: false };
         }
 
         const isAuthCheck = checklistItem.category === 'Authentication';
@@ -334,11 +322,18 @@ class Engine {
                 evidence_trail: this._buildProbeEvidenceTrail(probeSpec, httpResponse),
             }));
             logger.warn(`[AUTH_BLOCKED] ${checkName}: ${probeSpec.method} ${probeSpec.path} → ${httpResponse.status}`);
-            return;
+            return { classify: false };
         }
 
-        // 4. Classify verdict (throws InfrastructureError if AI unreachable)
-        const verdict = await classifyVerdict(probeSpec, httpResponse);
+        return { classify: true, checklistItem, probeSpec, httpResponse };
+    }
+
+    // -------------------------------------------------------------------------
+    // Normalize + guardrail + record one classified verdict — shared tail of
+    // the old _runAiProbe, now called once per entry after a batch classify.
+    // -------------------------------------------------------------------------
+    _finalizeVerdict(checklistItem, endpoint, probeSpec, httpResponse, verdict) {
+        const checkName = `checklist/${checklistItem.id}`;
         const normalized = this._normalizeResult(checkName, endpoint, {
             ...verdict,
             evidence_trail: this._buildProbeEvidenceTrail(probeSpec, httpResponse, verdict),
@@ -346,6 +341,93 @@ class Engine {
         this._applyGuardrail(normalized, checkName);
         this.context.addResult(normalized);
         this._logResult(normalized);
+    }
+
+    // -------------------------------------------------------------------------
+    // Run every requires_ai_probe item collected for one endpoint: ONE batched
+    // synthesis call for the whole set (cache-aware — only uncached items are
+    // actually sent), individual real HTTP execution + gating per item (that
+    // part can't batch, each is a real request against the target), then ONE
+    // batched classification call for whatever survived gating. This replaces
+    // calling synthesize+execute+classify once per item — see the
+    // probeSynthesizer/verdictClassifier module docs for why batching matters
+    // (up to ~2 AI calls per item per endpoint, now ~2 calls per endpoint total).
+    //
+    // The prompt is given the already-resolved path (real harvested IDs baked
+    // in) so the AI isn't left to invent its own concrete value for
+    // {{booking_id}}-style variables — inventing one independently is exactly
+    // how the AI-probe engine and the deterministic engine used to end up
+    // testing two different URLs for "the same" endpoint. The cache key still
+    // hashes the endpoint's original template path (see cache.js), so a
+    // harvested ID changing between runs doesn't invalidate cached decisions.
+    //
+    // A batch call failing outright (malformed response shape, not an
+    // InfrastructureError) flags every item it covered as TO BE CONFIRMED
+    // rather than silently dropping them from the report; InfrastructureError
+    // still propagates to abort the whole scan, same as every other AI stage.
+    // -------------------------------------------------------------------------
+    async _runAiProbesForEndpoint(aiProbeItems, endpoint, resolvedPath) {
+        if (aiProbeItems.length === 0) return;
+
+        let probeSpecs;
+        try {
+            probeSpecs = await synthesizeProbesBatch(aiProbeItems, endpoint, this._cache, resolvedPath);
+        } catch (err) {
+            if (err.name === 'InfrastructureError') throw err;
+            logger.error(`[Engine] Probe synthesis batch failed for ${endpoint.path}: ${err.message}`);
+            for (const item of aiProbeItems) {
+                this.context.addResult(this._normalizeResult(`checklist/${item.id}`, endpoint, {
+                    status:  'TO BE CONFIRMED',
+                    message: `Probe synthesis batch call failed (${err.message}) — flagged for manual review.`,
+                }));
+            }
+            return;
+        }
+
+        const toClassify = [];
+        for (const item of aiProbeItems) {
+            const checkName = `checklist/${item.id}`;
+            const probeSpec = probeSpecs.get(item.id);
+
+            if (!probeSpec) {
+                this.context.addResult(this._normalizeResult(checkName, endpoint, {
+                    status:  'N/A',
+                    message: `Probe synthesis determined this test is not applicable to ${endpoint.path}.`,
+                }));
+                logger.info(`[N/A] ${checkName}: Not applicable to ${endpoint.path}`);
+                continue;
+            }
+
+            try {
+                const gated = await this._executeProbeAndGate(item, endpoint, probeSpec);
+                if (gated.classify) toClassify.push(gated);
+            } catch (err) {
+                logger.error(`[Engine] Error executing probe for ${checkName} on ${endpoint.path}: ${err.message}`);
+            }
+        }
+
+        if (toClassify.length === 0) return;
+
+        let verdicts;
+        try {
+            verdicts = await classifyVerdictsBatch(
+                toClassify.map(({ probeSpec, httpResponse }) => ({ probeSpec, httpResponse }))
+            );
+        } catch (err) {
+            if (err.name === 'InfrastructureError') throw err;
+            logger.error(`[Engine] Verdict classification batch failed for ${endpoint.path}: ${err.message}`);
+            for (const { checklistItem } of toClassify) {
+                this.context.addResult(this._normalizeResult(`checklist/${checklistItem.id}`, endpoint, {
+                    status:  'TO BE CONFIRMED',
+                    message: `Verdict classification batch call failed (${err.message}) — flagged for manual review.`,
+                }));
+            }
+            return;
+        }
+
+        for (const { checklistItem, probeSpec, httpResponse } of toClassify) {
+            this._finalizeVerdict(checklistItem, endpoint, probeSpec, httpResponse, verdicts.get(checklistItem.id));
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -527,6 +609,13 @@ class Engine {
                 const applicability = await getApplicableItems(endpoint, protocolRelevantItems, this._cache);
                 const applicableSet = new Set(applicability.applicable_ids);
 
+                // Branch B (judgment-call) items are collected here instead of run
+                // immediately, so the whole endpoint's synthesis — then, after real
+                // requests fire, the whole endpoint's classification — can each go out
+                // as one batched AI call instead of one call per item. See
+                // _runAiProbesForEndpoint for why.
+                const aiProbeItems = [];
+
                 for (const item of protocolRelevantItems) {
                     if (!applicableSet.has(item.id)) {
                         // Emit N/A for excluded items so the report is complete
@@ -562,9 +651,7 @@ class Engine {
                                 ));
                                 logger.warn(`[MANUAL] checklist/${item.id}: No auth session — skipped without spending an AI call.`);
                             } else {
-                                // Branch B: judgment-call item → synthesize + execute + classify
-                                const resolvedPath = this.context.resolvePath(endpoint.path);
-                                await this._runAiProbe(item, endpoint, resolvedPath);
+                                aiProbeItems.push(item);
                             }
                         } else {
                             logger.warn(`[Engine] Checklist item ${item.id} has no handler — skipping.`);
@@ -575,6 +662,12 @@ class Engine {
                         logger.error(`[Engine] Error processing ${item.id} on ${endpoint.path}: ${err.message}`);
                     }
                 }
+
+                // Branch B: batched synthesize + (per-item) execute/gate + batched classify.
+                // Left unwrapped here (matching getApplicableItems above) so an
+                // InfrastructureError propagates straight up to abort the scan.
+                const resolvedPath = this.context.resolvePath(endpoint.path);
+                await this._runAiProbesForEndpoint(aiProbeItems, endpoint, resolvedPath);
 
             // ---------------------------------------------------------------
             // LEGACY MODE — flat list of hardcoded checks (unchanged behaviour)
