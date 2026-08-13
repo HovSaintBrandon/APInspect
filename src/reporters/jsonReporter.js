@@ -37,31 +37,28 @@ const generate = (results, outputPath) => {
             },
         };
 
-        const jsonContent = JSON.stringify({
-            timestamp: new Date().toISOString(),
-            summary,
-            results: results.map(r => ({
-                check: r.check,
-                endpoint: r.endpoint,
-                method: r.method,
-                status: r.status,
-                severity: r.severity || 'Info',
-                confirmation_status: r.confirmation_status || 'confirmed',
-                message: r.message,
-                details: r.details,
-                // AI fields: only included when present (undefined fields are
-                // stripped by JSON.stringify, keeping non-AI results clean)
-                ...(r.ai_confidence !== undefined && {
-                    ai_confidence: r.ai_confidence,
-                    ai_reasoning: r.ai_reasoning,
-                    evidence_cited: r.evidence_cited,
-                }),
-                // Evidence trail: emitted for every result that has one (hardcoded
-                // checks now carry one too — see engine.js _buildHardcodedEvidenceTrail).
-                // True N/A results (never sent a request) legitimately have none.
-                ...(r.evidence_trail && { evidence_trail: r.evidence_trail }),
-            }))
-        }, null, 2);
+        const jsonContent = JSON.stringify(results.map((r, index) => ({
+            id: index + 1,
+            check: r.check,
+            endpoint: r.endpoint,
+            method: r.method,
+            status: r.status,
+            severity: r.severity || 'Info',
+            confirmation_status: r.confirmation_status || 'confirmed',
+            message: r.message,
+            details: r.details,
+            // AI fields: only included when present (undefined fields are
+            // stripped by JSON.stringify, keeping non-AI results clean)
+            ...(r.ai_confidence !== undefined && {
+                ai_confidence: r.ai_confidence,
+                ai_reasoning: r.ai_reasoning,
+                evidence_cited: r.evidence_cited,
+            }),
+            // Evidence trail: emitted for every result that has one (hardcoded
+            // checks now carry one too — see engine.js _buildHardcodedEvidenceTrail).
+            // True N/A results (never sent a request) legitimately have none.
+            ...(r.evidence_trail && { evidence_trail: r.evidence_trail }),
+        })), null, 2);
 
         // Ensure dir exists
         const dir = path.dirname(reportPath);
