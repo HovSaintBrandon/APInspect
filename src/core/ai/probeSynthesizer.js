@@ -18,7 +18,7 @@
  * deterministic. Probes run at temperature 0.1 in non-cached mode to give
  * fuzzing-like variance.
  *
- * Throws InfrastructureError if the Cerebras API is unreachable after retries,
+ * Throws InfrastructureError if the OpenRouter API is unreachable after retries,
  * which aborts the scan rather than silently emitting N/A.
  *
  * Batch response contract (strict JSON from the model):
@@ -32,7 +32,7 @@
  */
 
 const logger = require('../../utils/logger');
-const { callCerebras } = require('../cerebrasClient');
+const { callOpenRouter } = require('../openrouterClient');
 
 // Caps how many checklist items go into a single synthesis call — keeps the
 // prompt bounded regardless of how large checklist.json grows; extra items
@@ -114,7 +114,7 @@ const resolveEntry = (item, byId, { method, endpoint, cache }) => {
  *   original template path so a harvested ID changing between runs doesn't
  *   invalidate the cache.
  * @returns {Promise<Map<string, object|null>>} check_id -> probe spec, or null if N/A
- * @throws {InfrastructureError} if Cerebras is unreachable after retries
+ * @throws {InfrastructureError} if OpenRouter is unreachable after retries
  */
 async function synthesizeProbesBatch(checklistItems, endpoint, cache = null, resolvedPath = null) {
     const method = (endpoint.methods && endpoint.methods[0]) || 'GET';
@@ -136,8 +136,8 @@ async function synthesizeProbesBatch(checklistItems, endpoint, cache = null, res
     for (let i = 0; i < uncached.length; i += MAX_BATCH_SIZE) {
         const chunk = uncached.slice(i, i + MAX_BATCH_SIZE);
 
-        // callCerebras throws InfrastructureError on retries exhausted — let it propagate.
-        const parsed = await callCerebras({
+        // callOpenRouter throws InfrastructureError on retries exhausted — let it propagate.
+        const parsed = await callOpenRouter({
             systemPrompt: SYSTEM_PROMPT,
             userContent: buildUserContent(chunk, method, endpoint, resolvedPath),
             temperature: cache ? 0 : 0.1, // Deterministic when using cache, slightly varied otherwise

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
+const path = require('node:path');
+require('dotenv').config({ path: path.resolve(__dirname, '../../.env') });
 
 const { Command } = require('commander');
 const chalk = require('chalk');
@@ -13,10 +14,24 @@ const newmanRunner = require('../core/newmanRunner');
 const logger = require('../utils/logger');
 const packageJson = require('../../package.json');
 const { resolveAuthMap, authValueToHeaders } = require('./authResolver');
-const { getCallCount } = require('../core/cerebrasClient');
+const { getCallCount } = require('../core/openrouterClient');
 const { isFail: isFailStatus, COVERAGE_GAP_STATUSES } = require('../core/statuses');
 
 const program = new Command();
+
+// Turns a Postman collection/folder name or spec file name into a filesystem-safe
+// directory name for default scan reports — see the `scan` command's baseOutput.
+const sanitizeForPath = (name) => {
+    const slug = (name || '')
+        .toString()
+        .trim()
+        .replace(/[^a-zA-Z0-9._-]+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^[.-]+|[.-]+$/g, '');
+    return slug || 'scan';
+};
+
+const runTimestamp = () => new Date().toISOString().replace(/[:.]/g, '-');
 
 program
     .name('apinspect')
@@ -56,26 +71,288 @@ program
     });
 
 program
-    .command('scan <file>')
+    .command('folders <file>')
+    .description('List the top-level folders in a Postman collection, with a request count per folder')
+    .action((file) => {
+        try {
+            const fs = require('node:fs');
+            const nodePath = require('node:path');
+            const { getPostmanFolderGroups } = require('../core/parser');
+
+            const absolutePath = nodePath.resolve(file);
+            if (!fs.existsSync(absolutePath)) {
+                throw new Error(`File not found: ${file}`);
+            }
+            const rawData = JSON.parse(fs.readFileSync(absolutePath, 'utf-8'));
+            if (!(rawData.info && rawData.info._postman_id)) {
+                throw new Error('Not a Postman collection (missing info._postman_id).');
+            }
+
+            const groups = getPostmanFolderGroups(rawData.item || []);
+            if (groups.length === 0) {
+                const total = (rawData.item || []).filter(i => i.request).length;
+                logger.info(`No folders — ${total} request(s) at the root of the collection.`);
+                return;
+            }
+
+            logger.title(`Folders in ${nodePath.basename(absolutePath)}:`);
+            groups.forEach((g, i) => {
+                logger.info(`  ${i + 1}) ${g.name} (${g.count} request${g.count === 1 ? '' : 's'})`);
+            });
+            logger.info('\nScope a scan to one or more with: apinspect scan <file> --folder "<name>"');
+        } catch (err) {
+            logger.error(`Failed to list folders: ${err.message}`);
+            process.exit(1);
+        }
+    });
+
+// -----------------------------------------------------------------------------
+// Abort handling — an InfrastructureError mid-scan means whatever ran before it
+// is still real evidence, just incomplete. printPartialResultsSummary recaps it
+// on the console (the live log already streamed every result, but by the time
+// an abort happens that's scrolled past); writeAbortLog persists the full
+// forensic detail (error, stack, which endpoint was in flight, sanitized CLI
+// args) to an append-only file so a history of aborts survives across runs.
+// -----------------------------------------------------------------------------
+const printPartialResultsSummary = (results) => {
+    if (results.length === 0) {
+        logger.warn('  No results were recorded before the abort.');
+        return;
+    }
+
+    const countByStatus = (status) => results.filter(r => r.status === status).length;
+    const gaps = results.filter(r => COVERAGE_GAP_STATUSES.includes(r.status)).length;
+    const knownStatuses = new Set(['PASS', 'WARN', 'TO BE CONFIRMED', 'MANUAL', 'N/A', ...COVERAGE_GAP_STATUSES]);
+    const failCount = results.filter(r => isFailStatus(r.status)).length;
+    const otherCount = results.filter(r => !isFailStatus(r.status) && !knownStatuses.has(r.status)).length;
+
+    logger.title(`\nPartial Results Summary (${results.length} check(s) recorded before the abort):`);
+    logger.info(
+        `  PASS: ${countByStatus('PASS')}  FAIL: ${failCount}  WARN: ${countByStatus('WARN')}  ` +
+        `TO BE CONFIRMED: ${countByStatus('TO BE CONFIRMED')}  MANUAL: ${countByStatus('MANUAL')}  ` +
+        `N/A: ${countByStatus('N/A')}  Coverage gaps: ${gaps}` +
+        (otherCount > 0 ? `  Other: ${otherCount}` : '')
+    );
+
+    const actionable = results.filter(r => isFailStatus(r.status) || r.status === 'WARN' || r.status === 'TO BE CONFIRMED');
+    if (actionable.length === 0) {
+        logger.success('  No FAIL / WARN / TO BE CONFIRMED findings recorded before the abort.');
+        return;
+    }
+
+    logger.title('\nActionable findings so far (FAIL / WARN / TO BE CONFIRMED):');
+    for (const r of actionable) {
+        const line = `[${r.status}] ${r.check} — ${r.method || ''} ${r.endpoint || ''}: ${r.message}`;
+        if (isFailStatus(r.status)) logger.error(line);
+        else logger.warn(line);
+    }
+};
+
+// CLI flags that take a credential as their next argv element — masked before
+// the abort log ever touches disk, since argv alone can't otherwise tell
+// "a flag's value" from "just another string".
+const ABORT_LOG_REDACT_FLAGS = new Set(['-t', '--token', '-p', '--password']);
+
+const sanitizeArgvForLog = (argv) => {
+    const sanitized = [];
+    for (let i = 0; i < argv.length; i++) {
+        sanitized.push(argv[i]);
+        if (ABORT_LOG_REDACT_FLAGS.has(argv[i])) {
+            sanitized.push('[REDACTED]');
+            i++; // skip the real value we just masked
+        }
+    }
+    return sanitized;
+};
+
+const writeAbortLog = ({ err, file, role, allResults, partialPath }) => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const abortLogPath = path.join(process.cwd(), 'reports', 'abortlogs.jsonl');
+
+    const record = {
+        timestamp: new Date().toISOString(),
+        apinspect_version: packageJson.version,
+        node_version: process.version,
+        command_args: sanitizeArgvForLog(process.argv),
+        input_file: file,
+        role: role || null,
+        endpoint_in_flight: err.scanContext?.endpoint || null,
+        error: {
+            name: err.name,
+            message: err.message,
+            reason: err.reason || null,
+            stack: err.stack,
+        },
+        partial_results_count: allResults.length,
+        partial_results_path: partialPath || null,
+    };
+
+    try {
+        fs.mkdirSync(path.dirname(abortLogPath), { recursive: true });
+        fs.appendFileSync(abortLogPath, `${JSON.stringify(record)}\n`);
+        logger.warn(`  Detailed abort log appended to: ${abortLogPath}`);
+    } catch (writeErr) {
+        logger.error(`  Failed to write abort log: ${writeErr.message}`);
+    }
+};
+
+// -----------------------------------------------------------------------------
+// Declarative mode — `apinspect scan --config apinspect.config.yaml`. Fully
+// config-driven, zero LLM calls, the only path meant to gate a CI pipeline.
+// See docs/APINSPECT-DECLARATIVE-MODE.md for the config format and rationale.
+// Coexists with the file-driven scan below rather than replacing it — see that
+// doc for why the AI-driven --checklist path isn't going anywhere.
+// -----------------------------------------------------------------------------
+const DECLARATIVE_SEVERITY_ORDER = { critical: 0, high: 1, medium: 2, low: 3 };
+
+const runDeclarativeScan = async (configPath) => {
+    const { loadConfig, resolveDeclarativeAuth } = require('../core/configSchema');
+    const { createClient } = require('../utils/httpClient');
+    const runner = require('../core/runner');
+    const artifacts = require('../core/artifacts');
+
+    let config, configHash;
+    try {
+        ({ config, configHash } = loadConfig(configPath));
+    } catch (err) {
+        logger.error(`Config error: ${err.message}`);
+        process.exit(2);
+    }
+
+    // Validate every referenced check ID up front — fail before sending a
+    // single request, not partway through a run because of a typo.
+    const unknownChecks = new Set();
+    for (const ep of config.endpoints) {
+        for (const checkId of ep.checks) {
+            if (!runner.isKnownCheck(checkId)) unknownChecks.add(checkId);
+        }
+    }
+    if (unknownChecks.size > 0) {
+        logger.error(`Unknown check ID(s) in config: ${[...unknownChecks].join(', ')}. Known checks: ${[...runner.VALID_CHECK_IDS].join(', ')}`);
+        process.exit(2);
+    }
+
+    let auth;
+    try {
+        auth = resolveDeclarativeAuth(config);
+    } catch (err) {
+        logger.error(err.message);
+        process.exit(err.code === 'AUTH_FAILED' ? 4 : 2);
+    }
+
+    let context;
+    let client;
+    try {
+        context = new Context({ base_url: config.target.base_url, auth, endpoints: [] });
+        client = createClient(config.target.base_url, context.getAuthHeaders(), 10000, context, config.target.allowlist);
+    } catch (err) {
+        // Thrown by allowlist.js when target.base_url's own host isn't in
+        // target.allowlist — a config mistake, not a runtime/infra failure.
+        logger.error(`Config error: ${err.message}`);
+        process.exit(2);
+    }
+
+    logger.title('Initializing APInspect (declarative mode)...');
+    logger.info(`Target: ${config.target.base_url}`);
+    logger.info(`Config hash: ${configHash}`);
+
+    const findings = [];
+    let completed = false;
+    let abortReason = null;
+
+    try {
+        for (const ep of config.endpoints) {
+            for (const method of ep.methods) {
+                logger.subTitle(`\nTesting Endpoint: ${ep.path} [${method}]`);
+                const endpointForCheck = { path: ep.path, methods: [method], body: ep.body };
+                for (const checkId of ep.checks) {
+                    const finding = await runner.runCheck(checkId, endpointForCheck, context, client);
+                    findings.push(finding);
+                    const line = `[${finding.status}] ${finding.check_id}: ${finding.message}`;
+                    if (finding.status === 'FAIL') logger.error(line);
+                    else if (finding.status === 'NOT_IMPLEMENTED' || finding.status === 'MANUAL') logger.warn(line);
+                    else logger.info(line);
+                }
+            }
+        }
+        completed = true;
+    } catch (err) {
+        abortReason = err.message;
+        logger.error(`\n✖ [ABORTED] ${err.message}`);
+    }
+
+    const { runDir, manifest } = artifacts.writeRun({ config, configHash, findings, completed, abortReason });
+    logger.title(`\nRun written to: ${runDir}`);
+    logger.info(`Findings: ${manifest.finding_count} total, ${manifest.fail_count} FAIL`);
+
+    if (!completed) {
+        logger.error('  Run did not complete every endpoint — treat results as INCOMPLETE, not passing.');
+        process.exit(config.gate.fail_on_partial ? 3 : 0);
+    }
+
+    if (config.gate.fail_on === 'none') {
+        logger.success('gate.fail_on is "none" — not gating on findings.');
+        process.exit(0);
+    }
+
+    const threshold = DECLARATIVE_SEVERITY_ORDER[config.gate.fail_on];
+    const gatingFindings = findings.filter(f => f.status === 'FAIL' && (DECLARATIVE_SEVERITY_ORDER[f.severity] ?? 3) <= threshold);
+    const totalFailCount = findings.filter(f => f.status === 'FAIL').length;
+    const maxExceeded = config.gate.max_new_findings !== null && totalFailCount > config.gate.max_new_findings;
+
+    if (gatingFindings.length > 0 || maxExceeded) {
+        logger.error(
+            `\n✖ Gate failed: ${gatingFindings.length} finding(s) at or above "${config.gate.fail_on}"` +
+            (maxExceeded ? `; total FAIL count ${totalFailCount} exceeds max_new_findings (${config.gate.max_new_findings})` : '') +
+            '.'
+        );
+        process.exit(1);
+    }
+
+    logger.success(`\n✔ Gate passed: no findings at or above "${config.gate.fail_on}".`);
+    process.exit(0);
+};
+
+program
+    .command('scan [file]')
     .description(
         'Scan an API definition: Postman collection or internal JSON, OpenAPI/Swagger (.json/.yaml/.yml), ' +
-        'GraphQL SDL (.graphql/.gql) or a live GraphQL URL for introspection, or a gRPC .proto file'
+        'GraphQL SDL (.graphql/.gql) or a live GraphQL URL for introspection, or a gRPC .proto file. ' +
+        'Or pass --config for declarative mode (config-driven, no LLM calls) — see docs/APINSPECT-DECLARATIVE-MODE.md'
     )
     .option('-t, --token <token>', 'Bearer token for authentication')
     .option('-u, --username <user>', 'Username for Basic Auth')
     .option('-p, --password <pass>', 'Password for Basic Auth')
     .option('-b, --base-url <url>', 'Base URL for REST/GraphQL specs, or "host:port" target for a gRPC .proto file')
     .option('--style <style>', 'API architecture style: rest, graphql, or grpc. Prompted interactively if omitted and the input file is ambiguous (Postman/OpenAPI/JSON).')
+    .option('-f, --folder <name...>', 'Restrict a Postman collection scan to specific top-level folder(s) by name (repeatable). Prompted interactively if omitted and the collection has folders.')
     .option('--auth-file <path>', 'Path to JSON file containing role:token mapping or login_endpoint config')
     .option('-o, --output <path>', 'Path to save report (.json, .csv, or .falcon.csv)')
     .option('--checklist', 'Run in checklist-driven mode using src/config/checklist.json + AI layer')
     .option('--cache <path>', 'Path to AI decision cache file. Generates on first run; CI reads from committed file.')
     .option('--fail-on <severity>', 'Fail with exit code 1 if any confirmed finding meets or exceeds this severity (critical, high, medium, low, info)')
     .option('--fail-on-tbc', 'Also fail on TO BE CONFIRMED findings that meet --fail-on severity (requires --fail-on)')
+    .option('--config <path>', 'Run in declarative mode against apinspect.config.yaml — config-driven, zero LLM calls, the only mode meant to gate CI. Mutually exclusive with a positional file.')
     .action(async (file, options) => {
+        if (options.config) {
+            if (file) {
+                logger.error('Cannot combine a positional file argument with --config — declarative mode takes its target and endpoints entirely from the config file.');
+                process.exit(2);
+            }
+            await runDeclarativeScan(options.config);
+            return;
+        }
+        if (!file) {
+            logger.error('Provide a file to scan, or --config <path> for declarative mode.');
+            process.exit(2);
+        }
+
         // Declared outside the try block so the catch handler can still report
         // partial results if an error is thrown mid-scan (see InfrastructureError handling below).
         const allResults = [];
+        let currentRole = null;
+        let baseOutput = null;
         try {
             logger.title('Initializing APInspect...');
 
@@ -100,7 +377,13 @@ program
             const cliStyle = options.style ? options.style.toLowerCase() : null;
 
             // 1. Parse Input
-            const config = await parse(file, options.baseUrl, cliStyle);
+            const config = await parse(file, options.baseUrl, cliStyle, options.folder);
+
+            // Default report path (no -o given): reports/<collection-or-folder-name>/report-<timestamp>.json.
+            // The directory tracks the collection/folder being scanned so repeat scans of the
+            // same input land together; the file name is unique per run so they don't clobber
+            // each other the way a fixed reports/report.json would.
+            baseOutput = options.output || path.join(process.cwd(), 'reports', sanitizeForPath(config.scanName), `report-${runTimestamp()}.json`);
 
             // 2. Initialise AI cache (if --cache is set)
             let aiCache = null;
@@ -114,6 +397,7 @@ program
 
             // Run scan for each role
             for (const [role, authValue] of Object.entries(authMap)) {
+                currentRole = role;
                 if (role !== 'default' && role !== 'unauthenticated') {
                     logger.title(`\n=== Starting scan for role: ${role.toUpperCase()} ===`);
                     config.auth = (typeof authValue === 'string') ? { type: 'bearer', token: authValue } : authValue;
@@ -148,6 +432,14 @@ program
                 const results = await engine.run();
                 allResults.push(...results);
 
+                // Run-level degradations (e.g. the AI provider ran out of balance
+                // partway through) are also embedded as a "system/aiProbeSynthesis"
+                // result above, but surface them here too so they aren't easy to miss
+                // in a long scrollback — the scan still completed, just not fully.
+                for (const warning of engine.context.getWarnings()) {
+                    logger.error(`\n⚠ [${role}] ${warning}`);
+                }
+
                 if (options.checklist) {
                     const na = results.filter(r => r.status === 'N/A').length;
                     const applicable = results.length - na;
@@ -161,9 +453,8 @@ program
                 }
 
                 // 5. Generate Report
-                let roleOutput = options.output;
-                if (roleOutput && role !== 'default' && role !== 'unauthenticated') {
-                    const path = require('path');
+                let roleOutput = baseOutput;
+                if (role !== 'default' && role !== 'unauthenticated') {
                     const parsed = path.parse(roleOutput);
                     if (parsed.base.endsWith('.falcon.csv')) {
                         roleOutput = path.join(parsed.dir, parsed.base.replace('.falcon.csv', `.${role}.falcon.csv`));
@@ -243,15 +534,33 @@ program
             if (err.name === 'InfrastructureError') {
                 // Infrastructure failure — not a security finding.
                 // Dump partial results so the run isn't a total loss, then abort.
+                //
+                // allResults only has results from roles whose engine.run() already
+                // resolved — the role that was actually in flight when this error hit
+                // never reached its own return, so its already-completed endpoints
+                // live only on the error itself (see engine.js run()). Without folding
+                // those in here too, a billing error on endpoint 31 of a 31-endpoint
+                // scan would report 0 partial results instead of the 30 that finished.
+                if (err.partialResults?.length > 0) allResults.push(...err.partialResults);
+
                 logger.error(`\n✖ [ABORTED] Infrastructure failure: ${err.message}`);
+                if (err.scanContext?.endpoint) logger.error(`  In flight when it aborted: ${err.scanContext.endpoint}`);
                 logger.error('  The scan was aborted. Partial results below are INCOMPLETE — do not use for gating.');
+                for (const warning of err.partialWarnings || []) {
+                    logger.error(`  ⚠ ${warning}`);
+                }
+
+                let partialPath = null;
                 if (allResults.length > 0) {
-                    const partialPath = options.output
-                        ? options.output.replace(/(\.[^.]+)?$/, '.partial$1')
-                        : require('path').join(process.cwd(), 'reports', 'partial-report.json');
+                    const target = baseOutput || path.join(process.cwd(), 'reports', 'partial-report.json');
+                    partialPath = target.replace(/(\.[^.]+)?$/, '.partial$1');
                     jsonReporter.generate(allResults, partialPath);
                     logger.warn(`  Partial results saved to: ${partialPath}`);
                 }
+
+                printPartialResultsSummary(allResults);
+                writeAbortLog({ err, file, role: currentRole, allResults, partialPath });
+
                 process.exit(3); // 3 = Infrastructure/Network Failure
             }
             logger.error(`Scan failed: ${err.message}`);
@@ -302,7 +611,7 @@ const getAiHeaderRecommendations = async (findings) => {
     const relevant = findings.filter(f => AI_RELEVANT_STATUSES.has(f.status));
     if (relevant.length === 0) return [];
 
-    const cerebrasClient = require('../core/cerebrasClient');
+    const openrouterClient = require('../core/openrouterClient');
     const userContent = relevant.map(f => ({
         header: f.header,
         status: f.status,
@@ -310,7 +619,7 @@ const getAiHeaderRecommendations = async (findings) => {
         message: f.message,
     }));
 
-    const parsed = await cerebrasClient.callCerebras({
+    const parsed = await openrouterClient.callOpenRouter({
         systemPrompt: AI_SYSTEM_PROMPT,
         userContent,
     });
@@ -439,7 +748,7 @@ Respond with strict JSON only, matching this shape:
 Base findings only on what the provided request/response and check results actually show. If nothing notable is present, return an empty findings array.`;
 
 const getAiEndpointAnalysis = async ({ request, response, checkResults }) => {
-    const cerebrasClient = require('../core/cerebrasClient');
+    const openrouterClient = require('../core/openrouterClient');
     const userContent = {
         request,
         response: {
@@ -452,7 +761,7 @@ const getAiEndpointAnalysis = async ({ request, response, checkResults }) => {
         checkResults: checkResults.map(r => ({ check: r.check, status: r.status, message: r.message })),
     };
 
-    return cerebrasClient.callCerebras({ systemPrompt: AI_CHECK_SYSTEM_PROMPT, userContent });
+    return openrouterClient.callOpenRouter({ systemPrompt: AI_CHECK_SYSTEM_PROMPT, userContent });
 };
 
 const printAiEndpointAnalysis = (analysis) => {
@@ -604,7 +913,7 @@ Respond with strict JSON only, matching this shape:
 { "summary": string, "analyses": [ { "issue": string, "severity": "critical"|"high"|"medium"|"low"|"info", "risk": string, "mitigation": string } ] }`;
 
 const getAiJwtRecommendations = async ({ header, payload, findings, liveResults }) => {
-    const cerebrasClient = require('../core/cerebrasClient');
+    const openrouterClient = require('../core/openrouterClient');
     const userContent = {
         header,
         payload,
@@ -614,7 +923,7 @@ const getAiJwtRecommendations = async ({ header, payload, findings, liveResults 
             attempts: liveResults.attempts.map(a => ({ name: a.name, verdict: a.verdict.verdict, reason: a.verdict.reason })),
         } : null,
     };
-    return cerebrasClient.callCerebras({ systemPrompt: AI_JWT_SYSTEM_PROMPT, userContent });
+    return openrouterClient.callOpenRouter({ systemPrompt: AI_JWT_SYSTEM_PROMPT, userContent });
 };
 
 const printAiJwtAnalysis = (analysis) => {

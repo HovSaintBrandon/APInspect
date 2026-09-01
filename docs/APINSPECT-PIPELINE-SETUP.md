@@ -16,7 +16,7 @@ APInspect never generates its own inputs — every scan is driven by two files a
 | API definition (Postman/OpenAPI/etc.) | ✅ Yes | It's just endpoint shape — no secrets in a well-formed export. This *should* live in the repo so the scan is reproducible and reviewable in a PR diff. |
 | Auth file **template** (`apinspect_auth.template.json`, with placeholders like `"password": "$STUDENT_PASSWORD"`) | ✅ Yes | Shows the shape of the real file without containing a real credential. |
 | Auth file with **real credentials filled in** | ❌ Never | This is a live username/password or login payload for a test account. Committing it puts a working credential in git history forever — even if you delete it in a later commit, it's still retrievable from history. |
-| `.env` / `CEREBRAS_API_KEY` | ❌ Never | It's a billing-linked API key. Anyone with repo read access (or anyone who forks/clones before you rotate it) can run up usage on your account. |
+| `.env` / `OPENROUTER_API_KEY` | ❌ Never | It's a billing-linked API key. Anyone with repo read access (or anyone who forks/clones before you rotate it) can run up usage on your account. |
 | `--cache` file (`.apinspect-cache.json`) | ✅ Optional, recommended | Contains AI *decisions* (which checks applied, what probe was built), not credentials or secrets — safe to commit, and doing so makes AI verdicts reproducible run-to-run instead of drifting slightly each time. |
 | `reports/` output | Usually ❌ (gitignored by default) | Reports can contain **evidence** — raw request/response bodies, which may include real tokens, PII, or internal data captured during the scan. Only commit a report deliberately as PR evidence, and check what's in it first. |
 
@@ -27,7 +27,7 @@ APInspect never generates its own inputs — every scan is driven by two files a
 - **Git history is permanent by default.** A credential committed once and "removed" in a later commit is still sitting in every clone and in the git log unless you rewrite history — which most teams never actually do.
 - **CI runners and forks widen the blast radius.** A GitHub Actions workflow on a public or semi-public repo can be triggered by a PR from a fork; if secrets are hardcoded in tracked files rather than injected via `secrets.*`, anyone who can open a PR can potentially read them out in workflow logs.
 - **It's a credential for a *real* account somewhere**, even if it's "just a test account." Test accounts often have access to shared staging data, shared infrastructure, or get promoted to have broader access over time as environments evolve — and don't assume test-account compromise is harmless.
-- **The Cerebras key is billable.** A leaked key isn't just an access risk, it's a direct cost risk — anyone with it can run inference on your account until you notice and rotate it.
+- **The OpenRouter key is billable.** A leaked key isn't just an access risk, it's a direct cost risk — anyone with it can run inference on your account until you notice and rotate it.
 
 This is exactly why the README's pattern is: commit a *template* auth file with placeholders, and materialize the real one from CI secrets at job start (`envsubst` / a heredoc step) — the real values never touch a tracked file.
 
@@ -44,7 +44,7 @@ Practical takeaway for the team: point `--base-url`/the auth file's `login_endpo
 
 1. Add the API definition file (Postman/OpenAPI/etc.) to the repo, committed normally.
 2. Write `ci/apinspect_auth.template.json` with placeholders, commit it.
-3. Add the real values (`STUDENT_PASSWORD`, `LOGIN_ENDPOINT`, `CEREBRAS_API_KEY`, `STAGING_API_URL`, etc.) as encrypted CI secrets — never in a file.
+3. Add the real values (`STUDENT_PASSWORD`, `LOGIN_ENDPOINT`, `OPENROUTER_API_KEY`, `STAGING_API_URL`, etc.) as encrypted CI secrets — never in a file.
 4. Add a CI step that materializes the real auth file from those secrets before the scan runs, into a path that is **not** tracked by git (e.g. `ci/apinspect_auth.json`, already gitignored).
 5. Point `--base-url` at staging/UAT, not production.
 6. Set `--fail-on high` (or your team's threshold) so the pipeline actually blocks on real findings.

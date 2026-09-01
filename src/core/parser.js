@@ -127,6 +127,83 @@ const dedupeEndpoints = (endpoints) => {
     return Array.from(seen.values());
 };
 
+// Counts leaf requests under a Postman item list, recursing through nested folders.
+const countPostmanRequests = (items) => {
+    let count = 0;
+    for (const item of items) {
+        if (item.item) count += countPostmanRequests(item.item);
+        else if (item.request) count += 1;
+    }
+    return count;
+};
+
+// Groups a Postman collection's top-level items into selectable buckets: one per direct
+// subfolder, plus a synthetic bucket for any requests sitting directly at the root
+// alongside those folders. Returns [] when the collection is flat (no folders at all),
+// so callers can skip the selection step entirely for the common case.
+const getPostmanFolderGroups = (items) => {
+    if (!items.some(item => item.item)) return [];
+
+    const groups = [];
+    const ungrouped = [];
+    for (const item of items) {
+        if (item.item) {
+            groups.push({ name: item.name, items: item.item, count: countPostmanRequests(item.item) });
+        } else if (item.request) {
+            ungrouped.push(item);
+        }
+    }
+    if (ungrouped.length > 0) {
+        groups.push({ name: '(ungrouped requests)', items: ungrouped, count: ungrouped.length });
+    }
+    return groups;
+};
+
+// Postman collections are commonly organized into folders (by resource, by role, by
+// workflow...). When folders are present, ask the user which ones to actually scan
+// instead of always running the whole collection.
+const promptFolderSelection = async (groups) => {
+    const readline = require('readline');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+    logger.info('This collection is organized into folders:');
+    groups.forEach((g, i) => {
+        logger.info(`  ${i + 1}) ${g.name} (${g.count} request${g.count === 1 ? '' : 's'})`);
+    });
+
+    const answer = await new Promise(resolve => {
+        rl.question('? Select folder(s) to scan — comma-separated numbers, or press Enter to scan all: ', ans => {
+            rl.close();
+            resolve(ans.trim());
+        });
+    });
+
+    if (!answer) return groups;
+
+    const indices = answer.split(',').map(s => Number.parseInt(s.trim(), 10) - 1);
+    const selected = indices
+        .filter(i => Number.isInteger(i) && i >= 0 && i < groups.length)
+        .map(i => groups[i]);
+
+    if (selected.length === 0) {
+        logger.warn('No valid folder selected — scanning the entire collection.');
+        return groups;
+    }
+    return selected;
+};
+
+// Non-interactive counterpart to promptFolderSelection, driven by --folder — matches
+// folder names case-insensitively so CI runs never have to hit the interactive prompt.
+const filterFolderGroupsByName = (groups, names) => {
+    const wanted = names.map(n => n.toLowerCase());
+    const missing = wanted.filter(n => !groups.some(g => g.name.toLowerCase() === n));
+    if (missing.length > 0) {
+        const available = groups.map(g => g.name).join(', ');
+        throw new Error(`Folder(s) not found in collection: ${missing.join(', ')}. Available: ${available}`);
+    }
+    return groups.filter(g => wanted.includes(g.name.toLowerCase()));
+};
+
 // Ambiguous inputs (Postman collections, OpenAPI/Swagger specs, raw internal JSON) could
 // describe a REST API or a single GraphQL endpoint fronted by REST-shaped tooling — the file
 // extension alone doesn't tell us. Unambiguous inputs (.graphql/.gql, .proto, a live GraphQL
@@ -148,7 +225,7 @@ const resolveAmbiguousStyle = async (cliStyle) => {
     return 'rest';
 };
 
-const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
+const parse = async (filePath, cliBaseUrl = null, cliStyle = null, cliFolders = null) => {
     try {
         // A live GraphQL endpoint URL — discovered via introspection, no local spec file involved.
         if (/^https?:\/\//i.test(filePath)) {
@@ -158,6 +235,7 @@ const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
                 base_url: discovered.base_url,
                 protocol: discovered.protocol,
                 endpoints: dedupeEndpoints(normalizeEndpoints(discovered.endpoints)),
+                scanName: new URL(filePath).hostname,
             };
         }
 
@@ -167,6 +245,9 @@ const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
         }
 
         const ext = path.extname(absolutePath).toLowerCase();
+        // Report file name for this input — stable across repeat scans of the
+        // same file so its reports land in the same reports/<scanName>/ dir.
+        const scanNameFromFile = path.basename(absolutePath, ext);
 
         // GraphQL SDL file
         if (ext === '.graphql' || ext === '.gql') {
@@ -176,6 +257,7 @@ const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
                 base_url: discovered.base_url,
                 protocol: discovered.protocol,
                 endpoints: dedupeEndpoints(normalizeEndpoints(discovered.endpoints)),
+                scanName: scanNameFromFile,
             };
         }
 
@@ -188,6 +270,7 @@ const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
                 protocol: discovered.protocol,
                 endpoints: dedupeEndpoints(normalizeEndpoints(discovered.endpoints)),
                 meta: discovered.meta,
+                scanName: scanNameFromFile,
             };
         }
 
@@ -219,6 +302,7 @@ const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
                 base_url: discovered.base_url,
                 protocol: style,
                 endpoints: dedupeEndpoints(normalizeEndpoints(discovered.endpoints).map(ep => ({ ...ep, protocol: style }))),
+                scanName: scanNameFromFile,
             };
         }
 
@@ -261,7 +345,27 @@ const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
                 config.base_url = config.base_url.slice(0, -1);
             }
 
-            config.endpoints = extractPostmanEndpoints(rawData.item, variables);
+            // Report file name for this scan — defaults to the whole collection, but
+            // narrows to the selected folder(s) below so a folder-scoped scan gets its
+            // own stable reports/<scanName>/ dir distinct from a full-collection scan.
+            config.scanName = rawData.info.name || scanNameFromFile;
+
+            // Scope to specific folder(s) if the collection has any.
+            let items = rawData.item;
+            const folderGroups = getPostmanFolderGroups(rawData.item);
+            if (folderGroups.length > 0) {
+                const selectedGroups = (cliFolders && cliFolders.length > 0)
+                    ? filterFolderGroupsByName(folderGroups, cliFolders)
+                    : await promptFolderSelection(folderGroups);
+
+                if (selectedGroups.length < folderGroups.length) {
+                    items = selectedGroups.flatMap(g => g.items);
+                    logger.info(`Scanning selected folder(s): ${selectedGroups.map(g => g.name).join(', ')}`);
+                    config.scanName = selectedGroups.map(g => g.name).join('+');
+                }
+            }
+
+            config.endpoints = extractPostmanEndpoints(items, variables);
             config.protocol = style;
             logger.info(`Extracted ${config.endpoints.length} endpoints from Postman collection.`);
 
@@ -269,6 +373,7 @@ const parse = async (filePath, cliBaseUrl = null, cliStyle = null) => {
             // Assume Standard Internal JSON Format
             config = rawData;
             if (!config.protocol) config.protocol = await resolveAmbiguousStyle(cliStyle);
+            config.scanName = config.name || scanNameFromFile;
         }
 
         // Validate
@@ -304,4 +409,4 @@ const parseRaw = async (filePath) => {
     return JSON.parse(fileContent);
 }
 
-module.exports = { parse, parseRaw };
+module.exports = { parse, parseRaw, getPostmanFolderGroups };

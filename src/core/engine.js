@@ -86,6 +86,14 @@ class Engine {
         // (Map<endpoint, {status, message}|null>) — null means the endpoint is healthy
         // and reachable, so nothing is gated.
         this._endpointGates = null;
+        // Set once an OpenRouter call fails with 401/402/403 (bad key, exhausted
+        // balance, blocked account) — that's account/billing exhaustion, not a
+        // transient blip, so every subsequent AI call this run would fail the exact
+        // same way. Once set, the engine stops spending AI calls entirely and falls
+        // back to deterministic-only checks for the rest of the scan instead of
+        // burning a failed request (and a crash) per remaining endpoint.
+        this._aiDisabled = false;
+        this._aiDisabledReason = null;
     }
 
     // -------------------------------------------------------------------------
@@ -361,18 +369,44 @@ class Engine {
     // hashes the endpoint's original template path (see cache.js), so a
     // harvested ID changing between runs doesn't invalidate cached decisions.
     //
-    // A batch call failing outright (malformed response shape, not an
-    // InfrastructureError) flags every item it covered as TO BE CONFIRMED
-    // rather than silently dropping them from the report; InfrastructureError
-    // still propagates to abort the whole scan, same as every other AI stage.
+    // A batch call failing outright (malformed response shape, or any other
+    // non-exhaustion InfrastructureError) flags every item it covered as TO BE
+    // CONFIRMED rather than silently dropping them from the report; a 401/402/403
+    // InfrastructureError (account/billing exhaustion — see _isAiExhaustionError)
+    // does the same but also disables AI probes for the rest of the scan instead
+    // of propagating to abort it — AI probe synthesis is an enhancement over the
+    // deterministic checklist, not a dependency, so exhausting the AI provider
+    // shouldn't take down the whole run.
     // -------------------------------------------------------------------------
     async _runAiProbesForEndpoint(aiProbeItems, endpoint, resolvedPath) {
         if (aiProbeItems.length === 0) return;
+
+        // AI already known unavailable this run (set by an earlier endpoint) —
+        // don't spend another call that's certain to fail the same way.
+        if (this._aiDisabled) {
+            for (const item of aiProbeItems) {
+                this.context.addResult(this._normalizeResult(`checklist/${item.id}`, endpoint, {
+                    status:  'TO BE CONFIRMED',
+                    message: `AI probe synthesis unavailable: ${this._aiDisabledReason} — flagged for manual review.`,
+                }));
+            }
+            return;
+        }
 
         let probeSpecs;
         try {
             probeSpecs = await synthesizeProbesBatch(aiProbeItems, endpoint, this._cache, resolvedPath);
         } catch (err) {
+            if (this._isAiExhaustionError(err)) {
+                this._disableAiProbes(err);
+                for (const item of aiProbeItems) {
+                    this.context.addResult(this._normalizeResult(`checklist/${item.id}`, endpoint, {
+                        status:  'TO BE CONFIRMED',
+                        message: `AI probe synthesis unavailable: ${err.message} — flagged for manual review.`,
+                    }));
+                }
+                return;
+            }
             if (err.name === 'InfrastructureError') throw err;
             logger.error(`[Engine] Probe synthesis batch failed for ${endpoint.path}: ${err.message}`);
             for (const item of aiProbeItems) {
@@ -414,6 +448,16 @@ class Engine {
                 toClassify.map(({ probeSpec, httpResponse }) => ({ probeSpec, httpResponse }))
             );
         } catch (err) {
+            if (this._isAiExhaustionError(err)) {
+                this._disableAiProbes(err);
+                for (const { checklistItem } of toClassify) {
+                    this.context.addResult(this._normalizeResult(`checklist/${checklistItem.id}`, endpoint, {
+                        status:  'TO BE CONFIRMED',
+                        message: `AI probe synthesis unavailable: ${err.message} — flagged for manual review.`,
+                    }));
+                }
+                return;
+            }
             if (err.name === 'InfrastructureError') throw err;
             logger.error(`[Engine] Verdict classification batch failed for ${endpoint.path}: ${err.message}`);
             for (const { checklistItem } of toClassify) {
@@ -428,6 +472,54 @@ class Engine {
         for (const { checklistItem, probeSpec, httpResponse } of toClassify) {
             this._finalizeVerdict(checklistItem, endpoint, probeSpec, httpResponse, verdicts.get(checklistItem.id));
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // AI-exhaustion detection/handling — see this._aiDisabled above. 401/402/403
+    // from OpenRouter (bad key, insufficient balance, blocked account) means
+    // every remaining AI call this run would fail the same way; anything else
+    // (malformed JSON, rate limits, transient network errors) is left to abort
+    // the scan as before, since those aren't necessarily permanent for the rest
+    // of the run.
+    // -------------------------------------------------------------------------
+    _isAiExhaustionError(err) {
+        return err?.name === 'InfrastructureError' && [401, 402, 403].includes(err.status);
+    }
+
+    _disableAiProbes(err) {
+        if (this._aiDisabled) return; // already disabled — keep the first reason
+        this._aiDisabled = true;
+        this._aiDisabledReason = err.message;
+        const banner = `AI probe synthesis unavailable: ${err.message}`;
+        logger.error(`[Engine] ${banner} — continuing with deterministic checks only for the rest of this scan.`);
+        this.context.addWarning(banner);
+        // Also emit a run-level result, not just an in-memory warning, so the
+        // degradation survives into every reporter (JSON/CSV/FALCON) as a real row
+        // instead of only living in the console log — a checklist-only report that
+        // looks complete when AI probe synthesis silently stopped running is worse
+        // than one that says so up front.
+        this.context.addResult(this._normalizeResult('system/aiProbeSynthesis', { path: null, methods: ['SYSTEM'] }, {
+            status:  'TO BE CONFIRMED',
+            message: `${banner} — AI-dependent checklist items for the remainder of this scan were flagged for manual review; deterministic checks continued running normally.`,
+        }));
+    }
+
+    // Shared catch-block handler for a single checklist item's processing error
+    // (used for both hardcoded-check execution paths above). A "hardcoded" check
+    // can itself be AI-backed (dataExposure/sensitiveDataAI calls OpenRouter under
+    // the hood) so it's exposed to the exact same exhaustion failure as the
+    // probe-synthesis path — handled the same way here rather than aborting.
+    _handleCheckError(err, item, endpoint) {
+        if (this._isAiExhaustionError(err)) {
+            this._disableAiProbes(err);
+            this.context.addResult(this._normalizeResult(`checklist/${item.id}`, endpoint, {
+                status:  'TO BE CONFIRMED',
+                message: `AI probe synthesis unavailable: ${err.message} — flagged for manual review.`,
+            }));
+            return;
+        }
+        if (err.name === 'InfrastructureError') throw err;
+        logger.error(`[Engine] Error processing ${item.id} on ${endpoint.path}: ${err.message}`);
     }
 
     // -------------------------------------------------------------------------
@@ -536,6 +628,16 @@ class Engine {
                 this._preflightCheck(this._endpointGates);
             }
             await this._runEndpoints();
+        } catch (err) {
+            // Whatever ran before the abort already added real results to the
+            // context — attach them to the error so the caller can still flush them
+            // to disk even though this run() call never reaches its own return
+            // below. Without this, a crash on endpoint 31 of a 31-endpoint scan
+            // silently discards the 30 that already completed, because the caller
+            // (cli/index.js) only sees this run()'s results on success.
+            err.partialResults = this.context.getResults();
+            err.partialWarnings = this.context.getWarnings();
+            throw err;
         } finally {
             // Persist whatever got cached even if an InfrastructureError aborted the
             // scan partway through — otherwise every applicability decision and probe
@@ -550,136 +652,167 @@ class Engine {
 
     async _runEndpoints() {
         for (const endpoint of this.context.endpoints) {
-            logger.subTitle(`\nTesting Endpoint: ${endpoint.path} [${endpoint.methods.join(', ')}]`);
-
-            // ---------------------------------------------------------------
-            // CHECKLIST MODE — driven by checklist.json + AI applicability
-            // ---------------------------------------------------------------
-            if (this._checklistMode) {
-                const endpointProtocol = endpoint.protocol || 'rest';
-                const gate = this._endpointGates?.get(endpoint) || null;
-
-                // 0. Cheaply exclude items tagged for a different protocol before spending
-                // an AI call on applicability — e.g. GraphQL-only items on a REST endpoint.
-                const protocolRelevantItems = checklist.filter(
-                    item => !item.applies_to || item.applies_to.includes(endpointProtocol)
-                );
-                for (const item of checklist) {
-                    if (item.applies_to && !item.applies_to.includes(endpointProtocol)) {
-                        this.context.addResult(this._normalizeResult(
-                            `checklist/${item.id}`, endpoint, {
-                                status:  'N/A',
-                                message: `Not applicable to protocol "${endpointProtocol}".`,
-                            }
-                        ));
-                    }
+            try {
+                await this._runEndpoint(endpoint);
+            } catch (err) {
+                // Tag which endpoint was in flight when an InfrastructureError aborted
+                // the scan — the CLI's abort handler surfaces this in the console
+                // summary and the abort log file, so "what was it doing when it died"
+                // doesn't require scrolling back through the whole run's live output.
+                if (err.name === 'InfrastructureError' && !err.scanContext) {
+                    err.scanContext = { endpoint: `${endpoint.methods.join(',')} ${endpoint.path}` };
                 }
+                throw err;
+            }
+        }
+    }
 
-                // 0b. Endpoint is gated (unresolved path template, 404, or 5xx on the
-                // baseline probe) — don't even spend the applicability AI call. Whether
-                // "DISC-01 applies to this endpoint" is not in question here; what's in
-                // question is whether the request could be meaningfully sent at all, and
-                // the gate already answered that. Only the small set of checks whose job
-                // IS to characterize reachability/auth/headers/errors still run for real
-                // (skipped too for UNRESOLVED_PATH, where no request can be sent at all).
-                if (gate) {
-                    for (const item of protocolRelevantItems) {
-                        if (gate.status !== 'UNRESOLVED_PATH' && GATE_EXEMPT_CHECKS.has(item.id) && item.maps_to_check && checksRegistry[item.maps_to_check]) {
-                            try {
-                                await this._runHardcodedCheck(
-                                    { name: `checklist/${item.id}`, run: checksRegistry[item.maps_to_check] },
-                                    endpoint
-                                );
-                            } catch (err) {
-                                if (err.name === 'InfrastructureError') throw err;
-                                logger.error(`[Engine] Error processing ${item.id} on ${endpoint.path}: ${err.message}`);
-                            }
-                        } else {
-                            this.context.addResult(this._normalizeResult(`checklist/${item.id}`, endpoint, gate));
+    async _runEndpoint(endpoint) {
+        logger.subTitle(`\nTesting Endpoint: ${endpoint.path} [${endpoint.methods.join(', ')}]`);
+
+        // ---------------------------------------------------------------
+        // CHECKLIST MODE — driven by checklist.json + AI applicability
+        // ---------------------------------------------------------------
+        if (this._checklistMode) {
+            const endpointProtocol = endpoint.protocol || 'rest';
+            const gate = this._endpointGates?.get(endpoint) || null;
+
+            // 0. Cheaply exclude items tagged for a different protocol before spending
+            // an AI call on applicability — e.g. GraphQL-only items on a REST endpoint.
+            const protocolRelevantItems = checklist.filter(
+                item => !item.applies_to || item.applies_to.includes(endpointProtocol)
+            );
+            for (const item of checklist) {
+                if (item.applies_to && !item.applies_to.includes(endpointProtocol)) {
+                    this.context.addResult(this._normalizeResult(
+                        `checklist/${item.id}`, endpoint, {
+                            status:  'N/A',
+                            message: `Not applicable to protocol "${endpointProtocol}".`,
                         }
-                    }
-                    logger.warn(`[${gate.status}] ${endpoint.path}: ${gate.message}`);
-                    continue;
+                    ));
                 }
+            }
 
-                // 1. Ask the applicability engine which items apply to this endpoint
-                // (pass the persistent cache through — without it, applicability decisions
-                // never survive past the in-process session Map, so every fresh invocation
-                // re-spends one AI call per endpoint even with --cache committed).
-                const applicability = await getApplicableItems(endpoint, protocolRelevantItems, this._cache);
-                const applicableSet = new Set(applicability.applicable_ids);
-
-                // Branch B (judgment-call) items are collected here instead of run
-                // immediately, so the whole endpoint's synthesis — then, after real
-                // requests fire, the whole endpoint's classification — can each go out
-                // as one batched AI call instead of one call per item. See
-                // _runAiProbesForEndpoint for why.
-                const aiProbeItems = [];
-
+            // 0b. Endpoint is gated (unresolved path template, 404, or 5xx on the
+            // baseline probe) — don't even spend the applicability AI call. Whether
+            // "DISC-01 applies to this endpoint" is not in question here; what's in
+            // question is whether the request could be meaningfully sent at all, and
+            // the gate already answered that. Only the small set of checks whose job
+            // IS to characterize reachability/auth/headers/errors still run for real
+            // (skipped too for UNRESOLVED_PATH, where no request can be sent at all).
+            if (gate) {
                 for (const item of protocolRelevantItems) {
-                    if (!applicableSet.has(item.id)) {
-                        // Emit N/A for excluded items so the report is complete
-                        this.context.addResult(this._normalizeResult(
-                            `checklist/${item.id}`, endpoint, {
-                                status:  'N/A',
-                                message: `Not applicable to this endpoint (filtered by applicability engine).`,
-                            }
-                        ));
-                        continue;
-                    }
-
-                    try {
-                        if (item.maps_to_check && checksRegistry[item.maps_to_check]) {
-                            // Branch A: hardcoded module exists → run it directly
+                    if (gate.status !== 'UNRESOLVED_PATH' && GATE_EXEMPT_CHECKS.has(item.id) && item.maps_to_check && checksRegistry[item.maps_to_check]) {
+                        try {
                             await this._runHardcodedCheck(
                                 { name: `checklist/${item.id}`, run: checksRegistry[item.maps_to_check] },
                                 endpoint
                             );
-                        } else if (item.requires_ai_probe) {
-                            if (item.requires_auth_session && !this.context.auth) {
-                                // Narrow precondition gate: BOLA, mass assignment, and
-                                // post-auth data-exposure checks are untestable without a
-                                // real session — the docs already say so (see
-                                // docs/APINSPECT-PIPELINE-SETUP.md). Skip the AI call
-                                // entirely rather than spending a synthesize+classify pass
-                                // to learn what we already know: MANUAL.
-                                this.context.addResult(this._normalizeResult(
-                                    `checklist/${item.id}`, endpoint, {
-                                        status:  'MANUAL',
-                                        message: `Requires an authenticated session to test meaningfully — no auth configured for this scan (-t/-u/-p/--auth-file).`,
-                                    }
-                                ));
-                                logger.warn(`[MANUAL] checklist/${item.id}: No auth session — skipped without spending an AI call.`);
-                            } else {
-                                aiProbeItems.push(item);
-                            }
-                        } else {
-                            logger.warn(`[Engine] Checklist item ${item.id} has no handler — skipping.`);
+                        } catch (err) {
+                            this._handleCheckError(err, item, endpoint);
                         }
-                    } catch (err) {
-                        // Re-throw infrastructure errors to abort the scan immediately
-                        if (err.name === 'InfrastructureError') throw err;
-                        logger.error(`[Engine] Error processing ${item.id} on ${endpoint.path}: ${err.message}`);
+                    } else {
+                        this.context.addResult(this._normalizeResult(`checklist/${item.id}`, endpoint, gate));
                     }
                 }
+                logger.warn(`[${gate.status}] ${endpoint.path}: ${gate.message}`);
+                return;
+            }
 
-                // Branch B: batched synthesize + (per-item) execute/gate + batched classify.
-                // Left unwrapped here (matching getApplicableItems above) so an
-                // InfrastructureError propagates straight up to abort the scan.
-                const resolvedPath = this.context.resolvePath(endpoint.path);
-                await this._runAiProbesForEndpoint(aiProbeItems, endpoint, resolvedPath);
-
-            // ---------------------------------------------------------------
-            // LEGACY MODE — flat list of hardcoded checks (unchanged behaviour)
-            // ---------------------------------------------------------------
+            // 1. Ask the applicability engine which items apply to this endpoint
+            // (pass the persistent cache through — without it, applicability decisions
+            // never survive past the in-process session Map, so every fresh invocation
+            // re-spends one AI call per endpoint even with --cache committed).
+            //
+            // Same AI-exhaustion handling as _runAiProbesForEndpoint: once the AI
+            // provider is known exhausted (401/402/403), don't spend another call
+            // that's certain to fail the same way — assume every item applies (same
+            // fallback legacy mode already uses unconditionally) and let the per-item
+            // loop below run the deterministic checks / flag the AI-probe ones as
+            // unavailable.
+            let applicableSet;
+            if (this._aiDisabled) {
+                applicableSet = new Set(protocolRelevantItems.map(item => item.id));
             } else {
-                for (const check of this.checks) {
-                    if (!legacyCheckAppliesTo(check.name, endpoint.protocol)) continue;
-                    try {
-                        await this._runHardcodedCheck(check, endpoint);
-                    } catch (err) {
-                        logger.error(`Check ${check.name} threw an error: ${err.message}`);
+                try {
+                    const applicability = await getApplicableItems(endpoint, protocolRelevantItems, this._cache);
+                    applicableSet = new Set(applicability.applicable_ids);
+                } catch (err) {
+                    if (!this._isAiExhaustionError(err)) throw err;
+                    this._disableAiProbes(err);
+                    applicableSet = new Set(protocolRelevantItems.map(item => item.id));
+                }
+            }
+
+            // Branch B (judgment-call) items are collected here instead of run
+            // immediately, so the whole endpoint's synthesis — then, after real
+            // requests fire, the whole endpoint's classification — can each go out
+            // as one batched AI call instead of one call per item. See
+            // _runAiProbesForEndpoint for why.
+            const aiProbeItems = [];
+
+            for (const item of protocolRelevantItems) {
+                if (!applicableSet.has(item.id)) {
+                    // Emit N/A for excluded items so the report is complete
+                    this.context.addResult(this._normalizeResult(
+                        `checklist/${item.id}`, endpoint, {
+                            status:  'N/A',
+                            message: `Not applicable to this endpoint (filtered by applicability engine).`,
+                        }
+                    ));
+                    continue;
+                }
+
+                try {
+                    if (item.maps_to_check && checksRegistry[item.maps_to_check]) {
+                        // Branch A: hardcoded module exists → run it directly
+                        await this._runHardcodedCheck(
+                            { name: `checklist/${item.id}`, run: checksRegistry[item.maps_to_check] },
+                            endpoint
+                        );
+                    } else if (item.requires_ai_probe) {
+                        if (item.requires_auth_session && !this.context.auth) {
+                            // Narrow precondition gate: BOLA, mass assignment, and
+                            // post-auth data-exposure checks are untestable without a
+                            // real session — the docs already say so (see
+                            // docs/APINSPECT-PIPELINE-SETUP.md). Skip the AI call
+                            // entirely rather than spending a synthesize+classify pass
+                            // to learn what we already know: MANUAL.
+                            this.context.addResult(this._normalizeResult(
+                                `checklist/${item.id}`, endpoint, {
+                                    status:  'MANUAL',
+                                    message: `Requires an authenticated session to test meaningfully — no auth configured for this scan (-t/-u/-p/--auth-file).`,
+                                }
+                            ));
+                            logger.warn(`[MANUAL] checklist/${item.id}: No auth session — skipped without spending an AI call.`);
+                        } else {
+                            aiProbeItems.push(item);
+                        }
+                    } else {
+                        logger.warn(`[Engine] Checklist item ${item.id} has no handler — skipping.`);
                     }
+                } catch (err) {
+                    this._handleCheckError(err, item, endpoint);
+                }
+            }
+
+            // Branch B: batched synthesize + (per-item) execute/gate + batched classify.
+            // _runAiProbesForEndpoint handles AI exhaustion internally (degrades and
+            // disables AI probes rather than throwing) — any InfrastructureError that
+            // still escapes it is a non-exhaustion failure, left to abort the scan.
+            const resolvedPath = this.context.resolvePath(endpoint.path);
+            await this._runAiProbesForEndpoint(aiProbeItems, endpoint, resolvedPath);
+
+        // ---------------------------------------------------------------
+        // LEGACY MODE — flat list of hardcoded checks (unchanged behaviour)
+        // ---------------------------------------------------------------
+        } else {
+            for (const check of this.checks) {
+                if (!legacyCheckAppliesTo(check.name, endpoint.protocol)) continue;
+                try {
+                    await this._runHardcodedCheck(check, endpoint);
+                } catch (err) {
+                    logger.error(`Check ${check.name} threw an error: ${err.message}`);
                 }
             }
         }

@@ -1,9 +1,9 @@
 /**
- * Standalone test for cerebrasClient.js
- * Run with: CEREBRAS_API_KEY=your_key node scratch/testCerebras.js
+ * Standalone test for openrouterClient.js
+ * Run with: OPENROUTER_API_KEY=your_key node scratch/testOpenRouter.js
  */
 
-const { scoreCheck } = require('../src/core/cerebrasClient');
+const { scoreCheck } = require('../src/core/openrouterClient');
 const SYSTEM_PROMPT = require('../src/checks/dataExposure/prompts/sensitiveDataExposure');
 
 const fakeEvidence = {
@@ -21,7 +21,7 @@ const fakeEvidence = {
 };
 
 (async () => {
-    console.log('Sending evidence to Cerebras...\n');
+    console.log('Sending evidence to OpenRouter...\n');
     const result = await scoreCheck({ systemPrompt: SYSTEM_PROMPT, evidence: fakeEvidence });
     console.log('Result:\n', JSON.stringify(result, null, 2));
 })();

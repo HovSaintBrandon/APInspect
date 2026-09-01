@@ -1,14 +1,14 @@
 /**
  * src/core/ai/applicabilityEngine.js
  *
- * For a given endpoint, asks Cerebras which checklist items are actually
+ * For a given endpoint, asks OpenRouter which checklist items are actually
  * applicable vs. N/A — so we skip WebSocket checks on a REST GET, etc.
  *
  * Applicability decisions are expensive — one batched LLM call per endpoint.
  * Results are cached via the injected AICache instance (persistent-cache) and
  * an in-process Map (session-level) so the same endpoint is never evaluated twice.
  *
- * Throws InfrastructureError if the Cerebras API is unreachable after retries,
+ * Throws InfrastructureError if the OpenRouter API is unreachable after retries,
  * which aborts the scan rather than silently applying all items.
  *
  * Output contract (strict JSON from the model):
@@ -20,7 +20,7 @@
  */
 
 const logger = require('../../utils/logger');
-const { callCerebras } = require('../cerebrasClient');
+const { callOpenRouter } = require('../openrouterClient');
 
 // In-memory session cache — keyed by "METHOD /path"
 const _sessionCache = new Map();
@@ -55,7 +55,7 @@ Respond ONLY with valid JSON matching this exact schema — no explanation, no m
  * @param {Array}  checklist - the full checklist array from checklist.json
  * @param {AICache|null} cache - optional persistent cache instance
  * @returns {Promise<{applicable_ids: string[], na_ids: string[]}>}
- * @throws {InfrastructureError} if Cerebras is unreachable after retries
+ * @throws {InfrastructureError} if OpenRouter is unreachable after retries
  */
 async function getApplicableItems(endpoint, checklist, cache = null) {
     const method = (endpoint.methods && endpoint.methods[0]) || 'GET';
@@ -88,8 +88,8 @@ async function getApplicableItems(endpoint, checklist, cache = null) {
         checklist_items: checklistSummary,
     };
 
-    // callCerebras throws InfrastructureError on retries exhausted — let it propagate
-    const parsed = await callCerebras({ systemPrompt: SYSTEM_PROMPT, userContent, temperature: 0 });
+    // callOpenRouter throws InfrastructureError on retries exhausted — let it propagate
+    const parsed = await callOpenRouter({ systemPrompt: SYSTEM_PROMPT, userContent, temperature: 0 });
 
     if (!Array.isArray(parsed.applicable_ids) || !Array.isArray(parsed.na_ids)) {
         throw new Error(`[ApplicabilityEngine] Malformed applicability response for ${sessionKey}`);

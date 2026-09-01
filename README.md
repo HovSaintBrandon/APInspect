@@ -125,7 +125,7 @@ Grading logic lives entirely in this repo — no third-party API, no rate limits
 ### Prerequisites
 - Node.js v14+
 - npm
-- A [Cerebras Cloud](https://cloud.cerebras.ai) API key (only required for `--checklist` mode — the AI-driven pipeline)
+- An [OpenRouter](https://openrouter.ai) API key (only required for `--checklist` mode — the AI-driven pipeline)
 
 ### Install
 
@@ -142,7 +142,7 @@ Without `npm link`, run it as `node src/cli/index.js <command>` from the repo ro
 
 ## Configuration
 
-Checklist mode needs a Cerebras API key. Copy the example env file and fill it in:
+Checklist mode needs an OpenRouter API key. Copy the example env file and fill it in:
 
 ```bash
 cp .env.example .env
@@ -150,12 +150,22 @@ cp .env.example .env
 
 ```env
 # .env
-CEREBRAS_API_KEY=your_key_here
+OPENROUTER_API_KEY=sk-or-v1-your_key_here
 ```
 
 `.env` is gitignored — never commit real keys. In CI, inject this as a secret environment variable instead (see [CI/CD](#embedding-in-a-cicd-pipeline)).
 
 Model and confidence thresholds are tunable in `src/config/aiConfig.js` — don't hardcode the model ID anywhere else.
+
+#### Model fallback — tiered router
+
+`AI_MODEL` in `aiConfig.js` is the primary model. `AI_MODEL_TIERS` is a pool of backup models split into groups of up to 3 — OpenRouter hard-caps its `models` fallback field at 3 entries total (a 4th 400s the whole request), so more than 3 candidates has to become more than one tier rather than one flat list. `src/core/modelTierRouter.js` picks which tier goes on the request: tier 0 by default, rotating to tier 1 once tier 0 looks unhealthy (`AI_MODEL_ROUTER_CONFIG` in the same file tunes the failure-count and latency thresholds for "unhealthy"), and looping back to tier 0 if tier 1 also goes bad. See [docs/MODEL-TIER-ROUTER-PLAN.md](docs/MODEL-TIER-ROUTER-PLAN.md) for the full design. Set `AI_MODEL_TIERS` to a single one-model tier (`[[AI_MODEL]]`) to disable rotation and fail closed on the primary alone — do this for a run whose result needs to be reproducible against one known model.
+
+`AI_PROVIDER_POLICY` in the same file is sent as OpenRouter's `provider` field on every call — `require_parameters: true` stops a fallback provider from silently ignoring `response_format: json_object` and returning prose instead of JSON, and `data_collection: 'deny'` opts every provider that ends up serving a call out of retaining the live scan data this tool sends (auth tokens, PII, internal error bodies from whatever you're scanning) for training. The stricter `zdr: true` (require a zero-data-retention *host*, not just a no-training policy) is commented out by default — it 404s ("No endpoints found matching your data policy") for any model whose providers aren't ZDR-enrolled, which was every model in the default config as of this writing. Confirm your target model actually has a ZDR-eligible host before uncommenting it.
+
+Picking free-tier models to put in `AI_MODEL_TIERS` is trickier than it looks — verified live against the real API, most of OpenRouter's free catalog isn't actually usable under the policy above: some models are only reachable through agentic-harness integrations, not the plain chat completions API; some have zero providers that support `require_parameters` + JSON mode at all; and some specifically require opting *into* training-data collection as the price of free access, which directly conflicts with `data_collection: 'deny'`. None of these clear up on retry — the comments above `AI_MODEL_TIERS` list exactly which excluded models hit which failure and why, so read those before adding a new candidate.
+
+When a fallback model actually answers a call, you'll see `[OpenRouterClient] Response served by fallback model "...", not requested "..."` in the log (once per distinct fallback model per run) — a different model can mean different tone and JSON reliability, so treat findings from a run that shows this line with a bit more scrutiny. A tier rotation logs as `[ModelTierRouter] Tier N unhealthy/is slow — rotating to tier M: [...]`.
 
 ---
 
@@ -169,7 +179,7 @@ This is what `parser.js` reads to build the attack surface (`config.endpoints`, 
 
 | You already have... | Give APInspect... | What happens |
 |---|---|---|
-| A Postman collection you export from Postman | the `.json` export, unmodified | `extractPostmanEndpoints` walks every `item`/folder and flattens it to `{ path, methods }`. You'll be asked (or pass `--style`) to confirm REST vs. GraphQL, since a Postman file alone doesn't say which. |
+| A Postman collection you export from Postman | the `.json` export, unmodified | `extractPostmanEndpoints` walks every `item`/folder and flattens it to `{ path, methods }`. You'll be asked (or pass `--style`) to confirm REST vs. GraphQL, since a Postman file alone doesn't say which. If the collection has top-level folders, you'll also be asked which one(s) to scan (or pass `--folder`) — see below. |
 | An OpenAPI/Swagger spec | the `.json`/`.yaml`/`.yml` file | `openapiAdapter` parses `paths` into endpoints automatically. |
 | A GraphQL schema | a `.graphql`/`.gql` SDL file, or just the live endpoint URL | `graphqlAdapter` builds endpoints from the schema, or introspects the live URL directly — no manual endpoint list needed either way. |
 | A gRPC service | the `.proto` file + `-b host:port` | `grpcAdapter` reflects the service definition into endpoints (one per RPC method). |
@@ -263,12 +273,37 @@ apinspect scan <file> [options]
 | `-u, --username <user>` / `-p, --password <pass>` | Basic Auth credentials |
 | `-b, --base-url <url>` | Base URL for REST/GraphQL, or `host:port` for a gRPC target |
 | `--style <rest\|graphql\|grpc>` | Architecture style. Skips the interactive prompt for ambiguous inputs. |
+| `-f, --folder <name...>` | Restrict a Postman collection scan to specific top-level folder(s) by name. Skips the interactive folder-picker prompt shown when the collection has folders. |
 | `--auth-file <path>` | Multi-role auth config — see [Authentication](#authentication) |
 | `--checklist` | Enable AI-driven checklist mode (recommended — otherwise a smaller hardcoded legacy check list runs) |
 | `--cache <path>` | Persist AI applicability/probe decisions to a file — reused on the next run against an unchanged target, and committable for deterministic CI runs |
-| `-o, --output <path>` | Report path — `.json`, `.csv`, or `.falcon.csv` (review spreadsheet format) |
+| `-o, --output <path>` | Report path — `.json`, `.csv`, or `.falcon.csv` (review spreadsheet format). Omit it and the report is written to `reports/<collection-or-folder-name>/report-<timestamp>.json` — the directory tracks the collection (or the `-f/--folder` name, when scoped) so repeat scans of the same input land together, while the timestamped file name keeps every run from overwriting the last. |
 | `--fail-on <severity>` | Exit code 1 if any confirmed finding meets/exceeds this severity: `critical`, `high`, `medium`, `low`, `info` |
 | `--fail-on-tbc` | Also count `TO BE CONFIRMED` findings toward `--fail-on` (requires `--fail-on`) |
+| `--config <path>` | Run in **declarative mode** instead — mutually exclusive with a positional `<file>` and every option above. See below. |
+
+### `apinspect scan --config <path>` — declarative mode (CI-safe, zero LLM calls)
+
+A second way to run `scan`, coexisting with the file-driven mode above (pick one per invocation —
+positional file *or* `--config`, never both). Fully config-driven: every check, endpoint, and
+authorized host is fixed by `apinspect.config.yaml` before the scan starts, with no LLM call
+anywhere in the path — the only mode meant to gate a CI pipeline on. Full contract, config format,
+check list, and exit codes: [docs/APINSPECT-DECLARATIVE-MODE.md](docs/APINSPECT-DECLARATIVE-MODE.md);
+example config: [apinspect.config.example.yaml](apinspect.config.example.yaml).
+
+```bash
+apinspect scan --config apinspect.config.yaml
+```
+
+### MCP server — local triage, never a gate
+
+A separate entrypoint (`src/mcp/server.js`, not part of the `apinspect` CLI binary) sharing the
+same core as declarative mode above. Five tools — `list_runs`, `get_findings`, `explain_finding`,
+`diff_runs` (all read-only, only ever reading what `scan --config` already wrote), and `run_check`
+(the only one that touches the target; rate-limited, session-capped, and audit-logged). No tool
+here can produce a pass/fail verdict — every result is tagged `"gating": false`. Full contract,
+constraints, and registration instructions:
+[docs/APINSPECT-MCP-SERVER.md](docs/APINSPECT-MCP-SERVER.md).
 
 ### `apinspect audit <file>` — Newman-backed response audit
 
@@ -525,7 +560,7 @@ jobs:
 
       - name: Run security scan
         env:
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           node apinspect-tool/src/cli/index.js scan collections/api.postman_collection.json \
             --checklist \
@@ -546,16 +581,16 @@ jobs:
 
 #### Using GitHub Secrets for the API key and target URL
 
-Both values the scan needs at runtime — `CEREBRAS_API_KEY` and the target's base URL — are ordinary strings the tool reads from an environment variable and a CLI flag respectively, which is exactly what GitHub Secrets exists to inject. Nothing tool-specific is required to make this work:
+Both values the scan needs at runtime — `OPENROUTER_API_KEY` and the target's base URL — are ordinary strings the tool reads from an environment variable and a CLI flag respectively, which is exactly what GitHub Secrets exists to inject. Nothing tool-specific is required to make this work:
 
-- `CEREBRAS_API_KEY` is read straight from `process.env` (`src/core/cerebrasClient.js`) — the workflow above sets it under `env:` on the scan step from `${{ secrets.CEREBRAS_API_KEY }}`, so the real key is never written into the workflow file, never appears in `git log`, and is masked in the Actions log output automatically.
+- `OPENROUTER_API_KEY` is read straight from `process.env` (`src/core/openrouterClient.js`) — the workflow above sets it under `env:` on the scan step from `${{ secrets.OPENROUTER_API_KEY }}`, so the real key is never written into the workflow file, never appears in `git log`, and is masked in the Actions log output automatically.
 - `${{ secrets.STAGING_API_URL }}` is substituted by GitHub *before* the shell command runs, so it's passed to `--base-url` like any other value — APInspect never has to know it came from a secret.
 - The same applies to anything referenced by `--auth-file`: if the JSON file itself contains real credentials, don't commit it — check it into a private path outside the repo, restore it from a secret at job start (see the `Write a secret to a file` pattern below), or better, keep the file structure in the repo but store the actual `password`/`payload` values as their own secrets and template them in with `envsubst` or a small `sed` step before the scan runs.
 
 To set these up once, in the repo's **Settings → Secrets and variables → Actions**:
 
 ```
-CEREBRAS_API_KEY   = <your real Cerebras key>
+OPENROUTER_API_KEY = <your real OpenRouter key>
 STAGING_API_URL    = https://staging.internal.example.com
 ```
 
@@ -574,7 +609,8 @@ where `ci/apinspect_auth.template.json` (safe to commit) contains `"password": "
 
 Key points for CI:
 - Always pass `--style` explicitly in CI — with no TTY attached, the interactive style prompt for ambiguous inputs (Postman/OpenAPI/raw JSON) will hang the job waiting for input it will never receive.
-- Store `CEREBRAS_API_KEY` and any `auth-file` credentials as encrypted CI secrets, never in the repo.
+- If the Postman collection has top-level folders, also pass `--folder` explicitly in CI (or scan a flat collection) — otherwise the interactive folder-picker prompt will hang the job the same way.
+- Store `OPENROUTER_API_KEY` and any `auth-file` credentials as encrypted CI secrets, never in the repo.
 - Commit a `--cache` file to the repo (or restore it from a CI cache action) so PR runs reuse prior AI decisions instead of re-synthesizing probes on every push — faster and cheaper.
 - Use `if: always()` on the report-upload step so you get the partial report even when the scan fails or aborts on an infrastructure error (exit code 3).
 - Treat exit code `3` differently from `1` in your pipeline logic if you want infra flakiness (AI backend down) to retry rather than fail the build outright.
@@ -649,7 +685,7 @@ jobs:
 
       - name: Run security scan
         env:
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           node apinspect-tool/src/cli/index.js scan collections/VenuefyProd.json \
             --checklist \
@@ -668,7 +704,7 @@ jobs:
           path: reports/
 ```
 
-Repo secrets to configure once (**Settings → Secrets and variables → Actions**): `CEREBRAS_API_KEY`, `STAGING_API_URL`, `LOGIN_ENDPOINT`, `STUDENT_EMAIL`, `STUDENT_PASSWORD` (add one email/password pair per role in your auth file).
+Repo secrets to configure once (**Settings → Secrets and variables → Actions**): `OPENROUTER_API_KEY`, `STAGING_API_URL`, `LOGIN_ENDPOINT`, `STUDENT_EMAIL`, `STUDENT_PASSWORD` (add one email/password pair per role in your auth file).
 
 ### GitLab CI
 
@@ -690,16 +726,20 @@ api_security_scan:
     paths:
       - reports/
   variables:
-    CEREBRAS_API_KEY: $CEREBRAS_API_KEY   # set as a masked CI/CD variable
+    OPENROUTER_API_KEY: $OPENROUTER_API_KEY   # set as a masked CI/CD variable
 ```
 
 ### Generic (Jenkins, CircleCI, etc.)
 
-The contract is the same everywhere: install Node, `npm ci`, set `CEREBRAS_API_KEY`, run `scan --checklist --style ... --fail-on ...`, check the exit code, archive `reports/`. Any pipeline that can run a shell step can gate on this.
+The contract is the same everywhere: install Node, `npm ci`, set `OPENROUTER_API_KEY`, run `scan --checklist --style ... --fail-on ...`, check the exit code, archive `reports/`. Any pipeline that can run a shell step can gate on this.
 
 ---
 
 ## Exit Codes
+
+This table covers `scan <file>` (the AI-checklist and legacy hardcoded paths). Declarative mode
+(`scan --config`) has its own, narrower exit-code contract — see
+[docs/APINSPECT-DECLARATIVE-MODE.md](docs/APINSPECT-DECLARATIVE-MODE.md#exit-codes).
 
 | Code | Meaning |
 |---|---|
@@ -707,6 +747,8 @@ The contract is the same everywhere: install Node, `npm ci`, set `CEREBRAS_API_K
 | `1` | A confirmed finding (or, with `--fail-on-tbc`, a `TO BE CONFIRMED` finding) met or exceeded the `--fail-on` severity — or a non-infrastructure runtime error occurred |
 | `2` | Invalid CLI arguments (bad `--fail-on`/`--style` value, or `--fail-on-tbc` used without `--fail-on`) |
 | `3` | Infrastructure failure — e.g. the AI backend was unreachable or returned a billing/auth error mid-scan, or the preflight check found every REST endpoint in the collection returning 404 (almost always a wrong `--base-url` or an unresolved path template). Partial results are still written to a `.partial.json` file, but **must not be used for gating** — treat as inconclusive, not passing. |
+
+On a code-`3` abort the console also prints a summary of whatever was recorded before the abort (pass/fail/warn counts, plus every FAIL/WARN/TO BE CONFIRMED finding so far) and which endpoint was in flight when it died — no need to open the `.partial.json` file just to see what happened. A full forensic record (timestamp, the exact error incl. stack trace, sanitized CLI args, endpoint in flight, role) is also appended as one JSON line to `reports/abortlogs.jsonl` — append-only, so a history of aborts across runs survives instead of each one overwriting the last.
 
 ---
 
@@ -739,7 +781,7 @@ src/
     context.js                Per-scan state: auth, endpoints, variable store, results
     discovery.js              Pre-scan reachability + variable harvesting
     headerGrader.js           securityheaders.com-style header scoring engine (no network)
-    cerebrasClient.js         AI backend HTTP client (retries, error classification)
+    openrouterClient.js      AI backend HTTP client (retries, error classification)
     ai/
       applicabilityEngine.js  Which checklist items apply to this endpoint
       probeSynthesizer.js     Builds a context-aware attack request
@@ -766,8 +808,8 @@ eval/
 
 ## Troubleshooting
 
-- **`Infrastructure failure: Cerebras API call failed: Request failed with status code 402`** — your Cerebras account is out of credits/quota. Top up or check billing at `cloud.cerebras.ai`; not a code bug.
-- **Scan hangs with no output** — you're likely running an ambiguous input (Postman/OpenAPI/JSON) without `--style` in a non-interactive shell (CI). Pass `--style rest|graphql|grpc` explicitly.
+- **`Infrastructure failure: OpenRouter API call failed: Request failed with status code 402`** — your OpenRouter account is out of credits/quota. Top up or check billing at `openrouter.ai/credits`; not a code bug.
+- **Scan hangs with no output** — you're likely running an ambiguous input (Postman/OpenAPI/JSON) without `--style` in a non-interactive shell (CI), or a Postman collection with folders without `--folder`. Pass `--style rest|graphql|grpc` and, if applicable, `--folder <name>` explicitly.
 - **`AUTH-01` and `AUTH-02`/`AUTH-03` disagree** — if you're on an older build, upgrade: a fixed version now reads the actual no-auth response status instead of assuming public access. Confirm the fix is present in `src/checks/authentication/authRequired.js`.
 - **`DATA-02` / other checks stuck on `MANUAL`: "No captured response available"** — run `apinspect audit <file>` first to populate the evidence store, then re-run `scan --checklist`.
 

@@ -1,0 +1,47 @@
+# Declarative-mode config for `apinspect scan --config apinspect.config.yaml`.
+# Copy this to apinspect.config.yaml (or any path) and edit target/endpoints for
+# your project — see docs/APINSPECT-DECLARATIVE-MODE.md for the full contract.
+# No CLI flag changes what this mode runs; everything comes from this one file.
+version: 1
+
+target:
+  base_url: https://api-dev.example.com
+  # Every host a request (including a redirect target) is allowed to reach.
+  # Enforced in src/core/allowlist.js — there is no CLI flag or tool argument
+  # anywhere that can add a host at runtime.
+  allowlist:
+    - api-dev.example.com
+    - api-staging.example.com
+
+# Optional — omit entirely to scan unauthenticated. A pre-provisioned bearer
+# token read from the named environment variable; no live login flow (that
+# would make the run's timing/success depend on a second network call this
+# mode is otherwise built to avoid).
+auth:
+  type: keycloak
+  token_env: APINSPECT_TOKEN
+
+endpoints:
+  - path: /identity/v1/provision/
+    methods: [GET]
+    checks: [API2_BROKEN_AUTH, API1_BOLA]
+  - path: /identity/v1/users/{id}/
+    methods: [GET, PATCH]
+    checks: [API1_BOLA, API5_BFLA, API3_BOPLA]
+    # Optional — the body sent on a body-carrying method (POST/PUT/PATCH).
+    # body:
+    #   display_name: "test"
+
+gate:
+  fail_on: high          # none | low | medium | high | critical
+  fail_on_partial: true  # an aborted run fails the build (exit 3); false = exit 0 despite the abort
+  max_new_findings: 0    # this pass: total FAIL count (no run-to-run diffing yet — see docs)
+
+# Optional — additional header/body field names (case-insensitive) to redact
+# in findings.json/findings.sarif evidence, beyond the built-in
+# authorization/cookie/x-api-key headers.
+# redact_fields: [ssn, national_id]
+
+output:
+  dir: .apinspect/runs
+  formats: [json, sarif]

@@ -9,6 +9,11 @@ class Context {
         // Derived state
         this.results = [];
 
+        // Run-level degradation notices (e.g. "AI probe synthesis unavailable: ...")
+        // — surfaced in the console summary and the JSON report, distinct from
+        // per-check results because they describe the run itself, not one endpoint.
+        this.warnings = [];
+
         // Evidence store: populated by newmanRunner before AI checks run.
         // Keyed as "METHOD /path" (e.g. "GET /api/users").
         // Initialized here so it exists before runAudit is called.
@@ -54,6 +59,14 @@ class Context {
 
     getResults() {
         return this.results;
+    }
+
+    addWarning(warning) {
+        this.warnings.push(warning);
+    }
+
+    getWarnings() {
+        return this.warnings;
     }
 
     setVariable(key, value) {

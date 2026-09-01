@@ -1,11 +1,11 @@
-const { scoreCheck } = require('../../core/cerebrasClient');
+const { scoreCheck } = require('../../core/openrouterClient');
 const SYSTEM_PROMPT = require('./prompts/sensitiveDataExposure');
 
 /**
  * AI-assisted check: Sensitive Data Exposure
  *
  * Reads captured request/response evidence from context.evidenceStore
- * and asks Cerebras to score this checklist item.
+ * and asks OpenRouter to score this checklist item.
  *
  * Falls back to MANUAL if:
  *  - No evidence was captured for this endpoint
@@ -33,7 +33,7 @@ module.exports = async (context, client, endpoint) => {
             method: evidence.method,
             statusCode: evidence.statusCode,
             responseHeaders: evidence.responseHeaders,
-            // Cap payload to avoid blowing Cerebras context window
+            // Cap payload to avoid blowing OpenRouter context window
             responseBody: evidence.responseBody.slice(0, 8000),
         },
     });

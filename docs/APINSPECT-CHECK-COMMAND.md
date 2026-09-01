@@ -21,7 +21,7 @@ This checked the DHA/SHA OAuth2 **token endpoint** used by our Livia ↔ HIE int
 
 1. **Request setup** — the URL is split into base URL + path, the method/headers/body are parsed from CLI flags, and any `-t/-u/-p/--auth-file` auth options are resolved into request headers.
 2. **Checklist engine runs** — a fixed suite of deterministic checks fires against the endpoint (see table below). Each check independently sends its own request(s) and returns a verdict: `PASS`, `FAIL`, `WARN`, or `MANUAL` (needs a human to confirm — not a finding by itself).
-3. **Optional AI pass (`--ai`)** — the actual request/response pair plus all deterministic check results are sent to an LLM (Cerebras), which is instructed to only report issues the evidence actually supports, and to produce a `summary` plus severity-rated `findings` with a risk explanation and a concrete mitigation each.
+3. **Optional AI pass (`--ai`)** — the actual request/response pair plus all deterministic check results are sent to an LLM (via OpenRouter), which is instructed to only report issues the evidence actually supports, and to produce a `summary` plus severity-rated `findings` with a risk explanation and a concrete mitigation each.
 4. **Report written (`-o`)** — every check result (and the AI findings, if requested) is serialized to the JSON file so it can be diffed over time, attached to a ticket, or fed into CI gating (`--fail-on <severity>` on the `scan` command does this automatically).
 
 ## The checklist, mapped to the run above

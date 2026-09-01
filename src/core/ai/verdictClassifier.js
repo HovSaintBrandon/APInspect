@@ -12,7 +12,7 @@
  * runs), so this is the one AI stage that still runs in full every single scan
  * — batching it is the highest-leverage cost cut available here.
  *
- * Uses the centralised cerebrasClient for all AI calls so retry logic,
+ * Uses the centralised openrouterClient for all AI calls so retry logic,
  * InfrastructureError propagation, and rate-limit handling are consistent
  * across all three AI pipeline stages.
  *
@@ -34,7 +34,7 @@
  */
 
 const logger = require('../../utils/logger');
-const { callCerebras } = require('../cerebrasClient');
+const { callOpenRouter } = require('../openrouterClient');
 
 // Caps how many probe/response pairs go into a single classify call — response
 // bodies are much larger than a checklist item description, so this is kept
@@ -130,6 +130,19 @@ const buildUserContent = (entries) => ({
     }),
 });
 
+// Shared shape for a verdict we couldn't actually get out of the model — either
+// one entry was missing from an otherwise-valid batch response, or the whole
+// batch response never parsed at all. Either way this is a coverage gap for
+// this specific check, not a security verdict, so it's flagged for manual
+// review rather than treated as PASS or FAIL.
+const _unresolvedVerdict = (message) => ({
+    status: 'TO BE CONFIRMED',
+    message,
+    ai_confidence: 0,
+    ai_reasoning: null,
+    evidence_cited: [],
+});
+
 // Resolves one entry's verdict from the parsed batch response, applying the
 // same deterministic PASS override and sanitized-body evidence used by the
 // non-batched classifier. Isolated so a missing/malformed entry for one probe
@@ -140,13 +153,7 @@ const resolveVerdict = ({ probeSpec, httpResponse }, byId) => {
 
     if (!parsed?.verdict || parsed.confidence === undefined) {
         logger.warn(`[VerdictClassifier] Missing/malformed verdict for "${checkId}" in batch response — flagging TO BE CONFIRMED.`);
-        return {
-            status: 'TO BE CONFIRMED',
-            message: 'AI batch response omitted or malformed this check\'s verdict — flagged for manual review.',
-            ai_confidence: 0,
-            ai_reasoning: null,
-            evidence_cited: [],
-        };
+        return _unresolvedVerdict('AI batch response omitted or malformed this check\'s verdict — flagged for manual review.');
     }
 
     const safeBody = truncatedBody(httpResponse.data);
@@ -175,7 +182,7 @@ const resolveVerdict = ({ probeSpec, httpResponse }, byId) => {
  *
  * @param {Array<{probeSpec: object, httpResponse: object}>} entries
  * @returns {Promise<Map<string, object>>} check_id -> normalized verdict result
- * @throws {InfrastructureError} if Cerebras is unreachable after retries
+ * @throws {InfrastructureError} if OpenRouter is unreachable after retries
  */
 async function classifyVerdictsBatch(entries) {
     const results = new Map();
@@ -184,8 +191,26 @@ async function classifyVerdictsBatch(entries) {
     for (let i = 0; i < entries.length; i += MAX_BATCH_SIZE) {
         const chunk = entries.slice(i, i + MAX_BATCH_SIZE);
 
-        // callCerebras throws InfrastructureError on retries exhausted — let it propagate.
-        const parsed = await callCerebras({ systemPrompt: SYSTEM_PROMPT, userContent: buildUserContent(chunk), temperature: 0 });
+        let parsed;
+        try {
+            // callOpenRouter throws InfrastructureError on retries exhausted.
+            parsed = await callOpenRouter({ systemPrompt: SYSTEM_PROMPT, userContent: buildUserContent(chunk), temperature: 0 });
+        } catch (err) {
+            // The model repeatedly writing unparseable JSON for this one batch (often
+            // because a probed response body itself contained quotes/JSON it echoed
+            // back unescaped into evidence_cited) is a coverage gap for these checks,
+            // not an outage — degrade just this chunk instead of aborting the whole
+            // scan. Real infra failures (network/auth/quota) don't carry this reason
+            // and still propagate to abort, same as before.
+            if (err.reason === 'malformed_json') {
+                logger.warn(`[VerdictClassifier] Batch response never parsed after retries — flagging ${chunk.length} check(s) as TO BE CONFIRMED: ${err.message}`);
+                for (const entry of chunk) {
+                    results.set(entry.probeSpec.check_id, _unresolvedVerdict('AI batch response failed to parse as JSON after retries — flagged for manual review.'));
+                }
+                continue;
+            }
+            throw err;
+        }
 
         if (!Array.isArray(parsed.verdicts)) {
             throw new TypeError(`[VerdictClassifier] Malformed batch response — expected a "verdicts" array.`);

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(node -c src/core/cerebrasClient.js)",
+      "Bash(node -c src/config/aiConfig.js)"
+    ]
+  }
+}
