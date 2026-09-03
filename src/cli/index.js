@@ -980,6 +980,7 @@ program
     .option('-H, --header <header...>', 'Extra request header as "Key: Value" (repeatable)')
     .option('--public-key <path>', 'Path to a PEM public key file — enables the RS/ES/PS -> HS256 algorithm-confusion attack')
     .option('--wordlist <path>', 'Path to a newline-delimited wordlist for HMAC secret cracking (merged with the built-in common-secrets list)')
+    .option('--extend-exp <minutes>', 'On every re-signable forgery (algorithm confusion, kid injection, cracked-secret), also push the "exp" claim forward this many minutes from now — tests whether the server enforces token lifetime server-side rather than trusting the client-supplied exp. Omit to leave exp untouched (cracked-secret forgery still defaults to its own 10-year push).')
     .option('-o, --output <path>', 'Path to save the full analysis as JSON')
     .option('-AI, --ai', 'Include AI-generated risk analysis and mitigation recommendations')
     .action(async (token, options) => {
@@ -990,6 +991,15 @@ program
             const {
                 crackHmacSecret, forgeAlgNone, forgeAlgConfusion, forgeKidInjection, forgeWithCrackedSecret,
             } = require('../core/jwt/jwtForge');
+
+            let extendExpMinutes;
+            if (options.extendExp !== undefined) {
+                extendExpMinutes = Number(options.extendExp);
+                if (!Number.isFinite(extendExpMinutes)) {
+                    logger.error(`Invalid --extend-exp value: "${options.extendExp}" — must be a number of minutes.`);
+                    process.exit(2);
+                }
+            }
 
             const decoded = decode(token);
 
@@ -1024,17 +1034,17 @@ program
             printJwtFindings(findings);
 
             // 3. Construct forgeries (offline — no network yet)
-            const forgeries = [...forgeAlgNone(decoded)];
+            const forgeries = [...forgeAlgNone(decoded, extendExpMinutes)];
 
             let publicKeyPem = null;
             if (options.publicKey) publicKeyPem = fs.readFileSync(options.publicKey, 'utf8');
-            const confusionForgery = forgeAlgConfusion(decoded, publicKeyPem);
+            const confusionForgery = forgeAlgConfusion(decoded, publicKeyPem, extendExpMinutes);
             if (confusionForgery) forgeries.push(confusionForgery);
 
-            forgeries.push(...forgeKidInjection(decoded));
+            forgeries.push(...forgeKidInjection(decoded, extendExpMinutes));
 
             if (crackedSecret !== null) {
-                forgeries.push(forgeWithCrackedSecret(decoded, crackedSecret));
+                forgeries.push(forgeWithCrackedSecret(decoded, crackedSecret, extendExpMinutes));
             }
 
             printJwtForgeries(forgeries);

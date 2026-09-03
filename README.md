@@ -438,6 +438,7 @@ apinspect jwt <token> [options]
 | `-H, --header <header...>` | Extra request header as `"Key: Value"` — repeatable |
 | `--public-key <path>` | PEM public key file — enables the RS/ES/PS → HS256 algorithm-confusion attack |
 | `--wordlist <path>` | Newline-delimited wordlist for HMAC secret cracking, merged with the built-in common-secrets list |
+| `--extend-exp <minutes>` | On every re-signable forgery (algorithm confusion, `kid` injection, cracked-secret), also push the `exp` claim forward this many minutes from *now* — see below. Omit it and `exp` is left untouched on those (cracked-secret forgery still defaults to its own 10-year push). |
 | `-o, --output <path>` | Write the decoded token, findings, forged tokens, and live results as JSON |
 | `-AI, --ai` | Ask the AI for a risk analysis and mitigations across everything found |
 
@@ -446,8 +447,15 @@ What it does, in order:
 2. **Header analysis** — flags `alg: none`, unrecognized algorithms, an injectable `kid`, and SSRF-prone `jku`/`x5u`/embedded `jwk`.
 3. **Claims analysis** — flags a missing/absent `exp`, an unusually long lifetime, missing `iss`/`aud`/`jti`, and sensitive-looking data sitting in the payload (it's base64, not encrypted).
 4. **Weak-secret cracking** — for `HS256`/`384`/`512` tokens, tries the signature against a built-in common-secrets list (extendable with `--wordlist`). A hit means the token can be forged outright.
-5. **Forges tokens**: `alg=none` (signature stripped, 3 casing variants), RS/ES/PS→HS256 algorithm confusion (if `--public-key` is given), `kid` injection (path traversal / SQLi payloads), and — if the secret was cracked — a re-signed token with any recognizable privilege claim (`role`, `isAdmin`, `scope`, etc.) escalated and `exp` pushed out 10 years.
+5. **Forges tokens**: `alg=none` (signature stripped, 3 casing variants), RS/ES/PS→HS256 algorithm confusion (if `--public-key` is given), `kid` injection (path traversal / SQLi payloads), and — if the secret was cracked — a re-signed token with any recognizable privilege claim (`role`, `isAdmin`, `scope`, etc.) escalated and `exp` pushed out 10 years (or `--extend-exp` minutes, if given).
 6. **Tests live**, if `--endpoint` is given: sends each forged token, plus a no-auth and original-token baseline, and classifies each as `accepted` / `rejected` / `inconclusive` (the endpoint doesn't enforce auth at all, so nothing is attributable to the forgery).
+
+**Testing token-lifetime enforcement (`--extend-exp`):** every forgery above that re-signs the token (algorithm confusion, `kid` injection, cracked-secret) can also push `exp` forward by an arbitrary number of minutes from the moment you run the command — independent of whichever signature-bypass technique got the forgery accepted in the first place. This matters most for a short-lived access token (e.g. a 5-minute Keycloak token, `exp - iat == 300`): if a server only validates the signature and never re-derives session/expiry state server-side, a forged-but-signature-valid token can outlive its intended window entirely, which `AUTH-02` ("are tokens validated server-side, not merely checked client-side") is specifically there to catch.
+
+```bash
+apinspect jwt "eyJhbGciOi..." --public-key ./keys/jwt_public.pem --extend-exp 60
+# → alg-confusion forgery now carries exp = now + 60 minutes instead of the original token's exp
+```
 
 ```bash
 apinspect jwt "eyJhbGciOi..." \
