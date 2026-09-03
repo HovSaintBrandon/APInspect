@@ -20,6 +20,7 @@
 - [Supported API Styles](#supported-api-styles)
 - [What Gets Checked](#what-gets-checked)
   - [Security Header Grading](#security-header-grading)
+  - [Cross-Object Identifier Confusion](#cross-object-identifier-confusion-bola-01)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Input Files You Need to Prepare](#input-files-you-need-to-prepare)
@@ -37,7 +38,7 @@
 
 ## The Core Idea
 
-Most API scanners are pattern-matchers: they fire a fixed set of payloads at every endpoint and hope something sticks. APInspect works differently — it runs a **security checklist** (34 items across 14 categories, modeled on the OWASP API Security Top 10 plus business-logic and infrastructure concerns) and, for every single endpoint, decides:
+Most API scanners are pattern-matchers: they fire a fixed set of payloads at every endpoint and hope something sticks. APInspect works differently — it runs a **security checklist** (35 items across 14 categories, modeled on the OWASP API Security Top 10 plus business-logic and infrastructure concerns) and, for every single endpoint, decides:
 
 1. **Does this check even apply here?** (an `AUTH-01` auth-enforcement check doesn't make sense against a public health-check endpoint; a `GQL-*` introspection check doesn't make sense against a REST endpoint)
 2. **If it applies, what's the smallest, safest request that actually tests it?** (a synthesized probe, tailored to that endpoint's shape — not a generic payload)
@@ -80,7 +81,9 @@ If the multi-role auth flow is used, the entire cycle above repeats once per rol
 | GraphQL | SDL file (`.graphql`/`.gql`) or a live endpoint URL (introspection)    | file extension, or `http(s)://` target — unambiguous, no prompt |
 | gRPC    | `.proto` file + `-b host:port` target                                 | `.proto` extension — unambiguous, no prompt |
 
-Style-specific checks live under `src/checks/graphql/` (introspection exposure, query-depth/complexity DoS) and `src/checks/grpc/` (metadata auth stripping, TLS enforcement, reflection, message-size limits). The general HTTP-semantic checks (auth, CORS, headers, injection, rate limiting) apply to both REST and GraphQL, since GraphQL runs over plain HTTP; gRPC is excluded from those since it has no HTTP verbs, `OPTIONS`, or `TRACE` to test.
+Style-specific checks live under `src/checks/graphql/` (introspection exposure, query-depth/complexity DoS) and `src/checks/grpc/` (metadata auth stripping, TLS enforcement, reflection, message-size limits). In **legacy mode** (no `--checklist`), the general HTTP-semantic checks (auth, CORS, headers, injection, rate limiting) apply to both REST and GraphQL, since GraphQL runs over plain HTTP; gRPC is excluded from those since it has no HTTP verbs, `OPTIONS`, or `TRACE` to test.
+
+> **Checklist mode caveat:** in `--checklist` mode (the recommended mode), every general checklist item's `applies_to` in `src/config/checklist.json` currently lists `"rest"` only — none also list `"graphql"` — so a checklist-mode scan of a GraphQL endpoint only evaluates the 3 `GQL-*` items; everything else (`AUTH-*`, `BOLA-01`, `INJ-*`, `DATA-*`, `MISC-*`, etc.) comes back `N/A` rather than actually running. If you need full-checklist coverage against GraphQL, add `"graphql"` to those items' `applies_to` arrays.
 
 ---
 
@@ -103,7 +106,9 @@ Style-specific checks live under `src/checks/graphql/` (introspection exposure, 
 | CI/CD & Infrastructure | Leaked credentials, exposed debug/staging endpoints |
 | GraphQL Security | Introspection exposure, query-depth DoS |
 | gRPC Security | Metadata auth stripping, TLS enforcement, reflection, message-size limits |
-| WebSocket Security | Auth on upgrade, message-level authorization |
+| WebSocket Security *(defined, not yet reachable)* | Auth on upgrade, message-level authorization |
+
+`WS-01`/`WS-02` are defined in the checklist but `applies_to: ["websocket"]` — there is no WebSocket style yet ([Supported API Styles](#supported-api-styles) covers REST/GraphQL/gRPC only), so no endpoint's `protocol` can ever match and these two items can't currently fire in either mode.
 
 ### Security Header Grading
 
@@ -163,9 +168,14 @@ cp .env.example .env
 ```env
 # .env
 OPENROUTER_API_KEY=sk-or-v1-your_key_here
+
+# Optional — if the primary key hits a rate/quota limit (429/402/403) mid-run,
+# src/core/openrouterClient.js switches to this one for the rest of the scan
+# instead of aborting.
+OPENROUTER_API_KEY_ALT=
 ```
 
-`.env` is gitignored — never commit real keys. In CI, inject this as a secret environment variable instead (see [CI/CD](#embedding-in-a-cicd-pipeline)).
+`.env` is gitignored — never commit real keys. In CI, inject these as secret environment variables instead (see [CI/CD](#embedding-in-a-cicd-pipeline)).
 
 Model and confidence thresholds are tunable in `src/config/aiConfig.js` — don't hardcode the model ID anywhere else.
 
@@ -282,10 +292,14 @@ apinspect scan <file> [options]
 | Option | Description |
 |---|---|
 | `-t, --token <token>` | Bearer token for authentication |
+| `-r, --refresh <token>` | Refresh token — renews the bearer token automatically if it expires mid-scan (requires `-t`). See the note right after this table — distinct from the standalone [`apinspect refresh`](#apinspect-refresh--standalone-token-refresh-loop) command, which keeps a token alive outside of a scan entirely. |
+| `--token-url <url>` | OAuth2/OIDC token endpoint used to redeem `-r`. Defaults to the standard Keycloak endpoint derived from the access token's `iss` claim. |
+| `--client-id <id>` | OAuth2 `client_id` used to redeem `-r`. Defaults to the access token's `azp`/`client_id` claim. |
+| `--client-secret <secret>` | OAuth2 `client_secret`, only needed for a confidential client |
 | `-u, --username <user>` / `-p, --password <pass>` | Basic Auth credentials |
 | `-b, --base-url <url>` | Base URL for REST/GraphQL, or `host:port` for a gRPC target |
 | `--style <rest\|graphql\|grpc>` | Architecture style. Skips the interactive prompt for ambiguous inputs. |
-| `-f, --folder <name...>` | Restrict a Postman collection scan to specific folder(s) by name, at any nesting depth — pass `"Parent/Child"` if the same name shows up under more than one parent. Skips the interactive folder-picker prompt shown when the collection has folders. |
+| `-f, --folder <name...>` | Restrict a Postman collection scan to specific folder(s) by name, at any nesting depth — pass `"Parent/Child"` if the same name shows up under more than one parent. Skips the interactive folder-picker prompt shown when the collection has folders. See [`apinspect folders <file>`](#apinspect-folders-file--list-a-collections-folders) to list them first. |
 | `--auth-file <path>` | Multi-role auth config — see [Authentication](#authentication) |
 | `--checklist` | Enable AI-driven checklist mode (recommended — otherwise a smaller hardcoded legacy check list runs) |
 | `--classification <text>` | Classification banner (e.g. `"C2 - Internal"`) stamped on the [simplified report](#reports) that's written alongside every `--checklist` run. Omit it and the field is left blank. |
@@ -294,6 +308,16 @@ apinspect scan <file> [options]
 | `--fail-on <severity>` | Exit code 1 if any confirmed finding meets/exceeds this severity: `critical`, `high`, `medium`, `low`, `info` |
 | `--fail-on-tbc` | Also count `TO BE CONFIRMED` findings toward `--fail-on` (requires `--fail-on`) |
 | `--config <path>` | Run in **declarative mode** instead — mutually exclusive with a positional `<file>` and every option above. See below. |
+
+With `-r`, APInspect checks the bearer token's expiry before every request and — if it's within 30 seconds of expiring — silently exchanges the refresh token for a new access token in place (`Context#ensureFreshToken`, `src/core/context.js`) before that request goes out, so a long scan doesn't fail auth partway through. This is separate from the standalone [`apinspect refresh`](#apinspect-refresh--standalone-token-refresh-loop) command below, which keeps a token alive independently of any scan.
+
+### `apinspect folders <file>` — list a collection's folders
+
+Lists every folder in a Postman collection, at any nesting depth, with a request count per folder — useful for finding the exact folder name (or `"Parent/Child"` path, if a name is ambiguous) to pass to `scan -f/--folder` without guessing or sitting through the interactive picker.
+
+```bash
+apinspect folders my-collection.postman_collection.json
+```
 
 ### `apinspect scan --config <path>` — declarative mode (CI-safe, zero LLM calls)
 
@@ -368,7 +392,7 @@ With `--ai`, each weak/missing/leaking header additionally gets an AI-generated 
 
 ### `apinspect check <url>` — full check sweep against a single live endpoint
 
-Runs the same hardcoded check suite as `scan` (discovery, HTTP method fuzzing, auth enforcement, CORS, security headers, sensitive data exposure, stack traces, rate limiting, SQLi/XSS and path-traversal fuzzing) against **one** endpoint — no Postman collection, OpenAPI spec, or discovery step required. Pass everything the request needs directly on the command line.
+Runs the same hardcoded check suite as `scan` (discovery, HTTP method fuzzing, auth enforcement, CORS, security headers, sensitive data exposure, stack traces, rate limiting, SQLi/XSS and path-traversal fuzzing) against **one** endpoint — no Postman collection, OpenAPI spec, or discovery step required. Pass everything the request needs directly on the command line. Full worked walkthrough: [docs/APINSPECT-CHECK-COMMAND.md](docs/APINSPECT-CHECK-COMMAND.md).
 
 ```bash
 apinspect check <url> [options]
@@ -380,6 +404,10 @@ apinspect check <url> [options]
 | `-H, --header <header...>` | Extra request header as `"Key: Value"` — repeatable |
 | `-d, --data <body>` | Request body — a JSON string, or `@path/to/file.json` |
 | `-t, --token <token>` | Bearer token for authentication |
+| `-r, --refresh <token>` | Refresh token — renews the bearer token automatically if it expires mid-check (requires `-t`); same mechanism as `scan`'s `-r` above |
+| `--token-url <url>` | OAuth2/OIDC token endpoint used to redeem `-r`. Defaults to the standard Keycloak endpoint derived from the access token's `iss` claim. |
+| `--client-id <id>` | OAuth2 `client_id` used to redeem `-r`. Defaults to the access token's `azp`/`client_id` claim. |
+| `--client-secret <secret>` | OAuth2 `client_secret`, only needed for a confidential client |
 | `-u, --username <user>` / `-p, --password <pass>` | Basic Auth credentials |
 | `--auth-file <path>` | Same auth-file format as `scan` — see [Authentication](#authentication) (only the `default`/first role is used) |
 | `-o, --output <path>` | Write check results (and AI findings, if `--ai`) as JSON |
@@ -577,7 +605,7 @@ Recommendations:
 
 ## Embedding in a CI/CD Pipeline
 
-APInspect is designed to be a **hard security gate**: it exits non-zero when a qualifying finding is present, so any CI system that checks exit codes works out of the box. See [Exit Codes](#exit-codes) below for the full contract — code `3` (infrastructure failure) is deliberately distinct from code `1` (real findings) so you don't silently pass a build just because the AI backend timed out.
+APInspect is designed to be a **hard security gate**: it exits non-zero when a qualifying finding is present, so any CI system that checks exit codes works out of the box. See [Exit Codes](#exit-codes) below for the full contract — code `3` (infrastructure failure) is deliberately distinct from code `1` (real findings) so you don't silently pass a build just because the AI backend timed out. For a first-time setup checklist (what to commit, UAT vs. prod targets, secrets), see [docs/APINSPECT-PIPELINE-SETUP.md](docs/APINSPECT-PIPELINE-SETUP.md).
 
 ### GitHub Actions
 
@@ -840,36 +868,59 @@ An item never exercised by the scan still gets a row, with `results: {}`.
 
 ```
 src/
+  index.js                    package.json `main` entry
   cli/
-    index.js                 CLI entry point (commander) — scan / audit / analyze / headers / check / jwt
-    authResolver.js          Shared auth-file/token/basic-auth resolution (scan + headers + check)
+    index.js                  CLI entry point (commander) — scan / folders / audit / analyze / headers / check / jwt / refresh
+    authResolver.js           Shared auth-file/token/basic-auth/collection-auth resolution (scan + headers + check)
   core/
-    parser.js                Input detection + normalization (Postman/OpenAPI/GraphQL/gRPC)
-    engine.js                Main scan loop — checklist mode + legacy mode
-    context.js                Per-scan state: auth, endpoints, variable store, results
-    discovery.js              Pre-scan reachability + variable harvesting
-    headerGrader.js           securityheaders.com-style header scoring engine (no network)
-    openrouterClient.js      AI backend HTTP client (retries, error classification)
+    parser.js                 Input detection + normalization (Postman/OpenAPI/GraphQL/gRPC) + collection-auth extraction
+    engine.js                 Main scan loop — checklist mode + legacy mode
+    context.js                Per-scan state: auth, endpoints, variable store, sample records, results
+    discovery.js               Pre-scan reachability + variable/sample-record harvesting
+    runner.js                  Declarative mode (`scan --config`) — runs the config's named checks per endpoint, no LLM
+    configSchema.js            Loads + validates `apinspect.config.yaml` for declarative mode
+    allowlist.js                Enforces declarative mode's target/redirect host allowlist — no runtime override
+    headerGrader.js            securityheaders.com-style header scoring engine (no network)
+    staticAnalyzer.js          `apinspect analyze` — structural checks, zero requests
+    newmanRunner.js             `apinspect audit` — Newman-backed collection run + response capture
+    statuses.js                  Shared status-vocabulary helpers (isFail, coverage-gap set, ...)
+    artifacts.js                 Declarative mode's output writer — findings.json/findings.sarif/manifest.json, with redaction
+    modelTierRouter.js           Picks which AI_MODEL_TIERS group to use, rotates on unhealthy
+    openrouterClient.js          AI backend HTTP client (retries, key fallback, error classification)
     ai/
-      applicabilityEngine.js  Which checklist items apply to this endpoint
-      probeSynthesizer.js     Builds a context-aware attack request
-      verdictClassifier.js    Judges the response, assigns confidence
+      applicabilityEngine.js     Which checklist items apply to this endpoint
+      probeSynthesizer.js        Builds a context-aware attack request (incl. cross-object BOLA-01 probes)
+      verdictClassifier.js       Judges the response, assigns confidence
+      cache.js                   Persistent `--cache` file — applicability/probe decisions
     jwt/
-      jwtCodec.js              Base64url decode/encode — raw JWT parsing, no verification
-      jwtStaticAnalysis.js     Header (alg/kid/jku/jwk) + claims (exp/aud/iss/jti) findings
-      jwtForge.js              Builds forged tokens: alg=none, alg confusion, secret cracking, kid injection
-      jwtLiveTester.js         Fires forged tokens at a live endpoint, classifies accepted/rejected/inconclusive
+      jwtCodec.js                Base64url decode/encode — raw JWT parsing, no verification
+      jwtStaticAnalysis.js       Header (alg/kid/jku/jwk) + claims (exp/aud/iss/jti) findings
+      jwtForge.js                Builds forged tokens: alg=none, alg confusion, secret cracking, kid injection
+      jwtLiveTester.js           Fires forged tokens at a live endpoint, classifies accepted/rejected/inconclusive
+      tokenRefresher.js          OAuth2 refresh_token exchange — backs both `scan -r` and `apinspect refresh`
+    checks/                     Declarative-mode (`scan --config`) check modules — API1_BOLA, API2_BROKEN_AUTH,
+                                 API3_BOPLA, API4_RATE_LIMIT, API5_BFLA, API8_2019_INJECTION, API8_MISCONFIG,
+                                 cvss.js (scoring), resultCombiner.js — see docs/APINSPECT-DECLARATIVE-MODE.md
   adapters/
-    rest/, graphql/, grpc/    Protocol-specific transport + discovery
-  checks/                     Hardcoded, deterministic check modules
-  reporters/                  json / csv / FALCON reporters
+    rest/, graphql/, grpc/     Protocol-specific transport + discovery
+  checks/                      Checklist/legacy-mode hardcoded, deterministic check modules (discovery/,
+                                authentication/, misconfigurations/, dataExposure/, errorHandling/,
+                                rateLimiting/, injection/, graphql/, grpc/)
+  reporters/                   jsonReporter / csvReporter / checklistReporter (FALCON) / simplifiedReporter
+  mcp/
+    server.js                  MCP server entry point — see docs/APINSPECT-MCP-SERVER.md
+  utils/
+    httpClient.js               Shared axios instance factory — variable resolution, token-refresh interceptor
+    logger.js                    Console output formatting
+    errors.js                    InfrastructureError
+    bodyFuzzer.js                Request-body mutation helpers for injection/mass-assignment checks
   config/
-    checklist.json            The 34-item security checklist
-    securityHeaderRules.json   Header grading rule set — weights, quality checks, recommendations
-    commonJwtSecrets.json      Built-in weak-secret wordlist for `apinspect jwt` HMAC cracking
-    aiConfig.js                Model + confidence threshold configuration
+    checklist.json              The 35-item security checklist
+    securityHeaderRules.json    Header grading rule set — weights, quality checks, recommendations
+    commonJwtSecrets.json       Built-in weak-secret wordlist for `apinspect jwt` HMAC cracking
+    aiConfig.js                  Model + confidence threshold configuration
 eval/
-  run.js                      Eval harness against a mock server + ground truth
+  run.js                       Eval harness against a mock server + ground truth
 ```
 
 ---
