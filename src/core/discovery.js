@@ -1,12 +1,51 @@
 const logger = require('../utils/logger');
 // We use a basic singularize fallback below
 
+// Field-name heuristic for "this looks like an entity identifier" — id/uuid/code/
+// ref/number variants, in any casing or snake/camel form. Deliberately narrow: the
+// goal is real cross-referenceable identifiers (health_id, contact_id, account_id),
+// not every scalar field on a record.
+const IDENTIFIER_KEY = /(^|_)(id|uuid|code|ref|number)$/i;
+
+// Excluded even if it matches IDENTIFIER_KEY above — these are secret-shaped, not
+// identifier-shaped, and harvested sample records get fed straight into AI probe
+// prompts later, so a field like "otp_code" or "pin_number" must never end up there.
+const SECRET_KEY = /password|secret|token|otp|pin|cvv|ssn/i;
+
+// Pulls every identifier-shaped, non-secret scalar field off a harvested record —
+// the reduced shape stored in Context#sampleRecords for cross-object probe synthesis.
+// Returns null if nothing qualifies (e.g. the record's only "id"-like field is the
+// resource's own primary key, already captured by the single-variable harvest above).
+const extractIdentifierFields = (record) => {
+    const fields = {};
+    for (const [key, value] of Object.entries(record)) {
+        if ((typeof value !== 'string' && typeof value !== 'number') || value === '') continue;
+        if (!IDENTIFIER_KEY.test(key) || SECRET_KEY.test(key)) continue;
+        fields[key] = value;
+    }
+    return Object.keys(fields).length > 0 ? fields : null;
+};
+
 // Simple singularizer since we don't know if 'pluralize' is installed
 const toSingular = (word) => {
     if (word.endsWith('ies')) return word.slice(0, -3) + 'y';
     if (word.endsWith('ses')) return word.slice(0, -2);
     if (word.endsWith('s') && !word.endsWith('ss')) return word.slice(0, -1);
     return word;
+};
+
+// Separately from the single-variable harvest in _harvestPass (which only ever
+// keeps one id for path substitution), also captures up to two DISTINCT array
+// entries' full identifier-field sets. Two different array entries are, by
+// construction, two different entities — exactly the "record A" / "record B"
+// pair the AI probe layer needs to test cross-object identifier confusion
+// (BOLA-01) with real, resolvable foreign IDs instead of guesses.
+const _harvestSampleRecords = (context, targetArray, resolvedPath) => {
+    for (const item of targetArray.slice(0, 2)) {
+        if (!item || typeof item !== 'object') continue;
+        const idFields = extractIdentifierFields(item);
+        if (idFields) context.addSampleRecord(`GET ${resolvedPath}`, idFields);
+    }
 };
 
 /**
@@ -62,7 +101,7 @@ const _harvestPass = async (context, client) => {
                     if (firstItem && typeof firstItem === 'object') {
                         // Extract a potential ID
                         const idValue = firstItem._id || firstItem.id || firstItem.uuid || firstItem.code || firstItem.staffNumber || firstItem.idNumber;
-                        
+
                         if (idValue) {
                             // Derive variable name from path (e.g., /api/v2/bookings -> booking_id)
                             const segments = resolvedPath.split('/').filter(Boolean);
@@ -78,6 +117,8 @@ const _harvestPass = async (context, client) => {
                             }
                         }
                     }
+
+                    _harvestSampleRecords(context, targetArray, resolvedPath);
                 }
             }
         } catch (err) {

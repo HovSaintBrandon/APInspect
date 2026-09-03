@@ -44,6 +44,7 @@ Rules:
 - Injection applies to endpoints with query parameters or request bodies.
 - Discovery applies to all endpoints.
 - CORS/Misconfigurations apply to all endpoints.
+- BOLA-01 (cross-object identifier confusion) applies only when the endpoint's body (shown in endpoint_context as "body") contains two or more distinct identifier-shaped fields (e.g. a subject id plus a separately named contact/account/delivery id) — a body with zero or exactly one identifier field has nothing to confuse, mark it N/A. GET-only endpoints with no body are also N/A unless the path itself carries more than one id-shaped segment.
 
 Respond ONLY with valid JSON matching this exact schema — no explanation, no markdown:
 {"endpoint": "<METHOD /path>", "applicable_ids": ["ID-01", ...], "na_ids": ["ID-02", ...]}`;
@@ -84,6 +85,7 @@ async function getApplicableItems(endpoint, checklist, cache = null) {
             endpoint: sessionKey,
             method,
             path: endpoint.path,
+            body: endpoint.body || null,
         })}\n</endpoint_context>`,
         checklist_items: checklistSummary,
     };

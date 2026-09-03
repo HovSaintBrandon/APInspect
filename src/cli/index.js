@@ -9,11 +9,12 @@ const Engine = require('../core/engine');
 const Context = require('../core/context');
 const jsonReporter = require('../reporters/jsonReporter');
 const checklistReporter = require('../reporters/checklistReporter');
+const simplifiedReporter = require('../reporters/simplifiedReporter');
 const staticAnalyzer = require('../core/staticAnalyzer');
 const newmanRunner = require('../core/newmanRunner');
 const logger = require('../utils/logger');
 const packageJson = require('../../package.json');
-const { resolveAuthMap, authValueToHeaders } = require('./authResolver');
+const { resolveAuthMap, authValueToHeaders, assertLooksLikeToken } = require('./authResolver');
 const { getCallCount } = require('../core/openrouterClient');
 const { isFail: isFailStatus, COVERAGE_GAP_STATUSES } = require('../core/statuses');
 
@@ -72,7 +73,7 @@ program
 
 program
     .command('folders <file>')
-    .description('List the top-level folders in a Postman collection, with a request count per folder')
+    .description('List every folder in a Postman collection, at any nesting depth, with a request count per folder')
     .action((file) => {
         try {
             const fs = require('node:fs');
@@ -97,9 +98,14 @@ program
 
             logger.title(`Folders in ${nodePath.basename(absolutePath)}:`);
             groups.forEach((g, i) => {
-                logger.info(`  ${i + 1}) ${g.name} (${g.count} request${g.count === 1 ? '' : 's'})`);
+                const indent = '  '.repeat(g.depth - 1);
+                logger.info(`  ${i + 1}) ${indent}${g.name} (${g.count} request${g.count === 1 ? '' : 's'})`);
             });
-            logger.info('\nScope a scan to one or more with: apinspect scan <file> --folder "<name>"');
+            logger.info(
+                '\nScope a scan to one or more with: apinspect scan <file> --folder "<name>" ' +
+                '(a parent folder scans everything inside it; an indented subfolder scans just that slice — ' +
+                'use "Parent/Child" if the same name appears under more than one parent)'
+            );
         } catch (err) {
             logger.error(`Failed to list folders: ${err.message}`);
             process.exit(1);
@@ -322,14 +328,19 @@ program
         'Or pass --config for declarative mode (config-driven, no LLM calls) — see docs/APINSPECT-DECLARATIVE-MODE.md'
     )
     .option('-t, --token <token>', 'Bearer token for authentication')
+    .option('-r, --refresh <token>', 'Refresh token — renews the bearer token automatically if it expires mid-scan (requires --token)')
+    .option('--token-url <url>', 'OAuth2/OIDC token endpoint used to redeem --refresh. Defaults to the standard Keycloak endpoint derived from the access token\'s "iss" claim.')
+    .option('--client-id <id>', 'OAuth2 client_id used to redeem --refresh. Defaults to the access token\'s "azp"/"client_id" claim.')
+    .option('--client-secret <secret>', 'OAuth2 client_secret, only needed for a confidential client')
     .option('-u, --username <user>', 'Username for Basic Auth')
     .option('-p, --password <pass>', 'Password for Basic Auth')
     .option('-b, --base-url <url>', 'Base URL for REST/GraphQL specs, or "host:port" target for a gRPC .proto file')
     .option('--style <style>', 'API architecture style: rest, graphql, or grpc. Prompted interactively if omitted and the input file is ambiguous (Postman/OpenAPI/JSON).')
-    .option('-f, --folder <name...>', 'Restrict a Postman collection scan to specific top-level folder(s) by name (repeatable). Prompted interactively if omitted and the collection has folders.')
+    .option('-f, --folder <name...>', 'Restrict a Postman collection scan to specific folder(s) by name, at any nesting depth (repeatable) — pass "Parent/Child" to target a subfolder whose name alone is ambiguous. Prompted interactively if omitted and the collection has folders.')
     .option('--auth-file <path>', 'Path to JSON file containing role:token mapping or login_endpoint config')
     .option('-o, --output <path>', 'Path to save report (.json, .csv, or .falcon.csv)')
     .option('--checklist', 'Run in checklist-driven mode using src/config/checklist.json + AI layer')
+    .option('--classification <text>', 'Classification banner (e.g. "C2 - Internal") stamped on the simplified report emitted alongside every --checklist run')
     .option('--cache <path>', 'Path to AI decision cache file. Generates on first run; CI reads from committed file.')
     .option('--fail-on <severity>', 'Fail with exit code 1 if any confirmed finding meets or exceeds this severity (critical, high, medium, low, info)')
     .option('--fail-on-tbc', 'Also fail on TO BE CONFIRMED findings that meet --fail-on severity (requires --fail-on)')
@@ -379,6 +390,10 @@ program
             // 1. Parse Input
             const config = await parse(file, options.baseUrl, cliStyle, options.folder);
 
+            // Shared across every role's simplified report so a multi-role run stamps
+            // one consistent date rather than drifting across roles/minutes.
+            const scanDate = new Date();
+
             // Default report path (no -o given): reports/<collection-or-folder-name>/report-<timestamp>.json.
             // The directory tracks the collection/folder being scanned so repeat scans of the
             // same input land together; the file name is unique per run so they don't clobber
@@ -393,7 +408,7 @@ program
             }
 
             // 2. Auth handling
-            const authMap = await resolveAuthMap(options);
+            const authMap = await resolveAuthMap(options, config.collectionAuth);
 
             // Run scan for each role
             for (const [role, authValue] of Object.entries(authMap)) {
@@ -472,6 +487,23 @@ program
                 } else {
                     // Default to JSON
                     jsonReporter.generate(results, roleOutput);
+                }
+
+                // Simplified report: always written alongside the primary report in
+                // checklist mode — a flat, client-facing audit matrix pivoted off the
+                // same checklist items, next to whichever primary format was chosen above.
+                if (options.checklist) {
+                    const parsedRole = path.parse(roleOutput);
+                    const stem = parsedRole.base.endsWith('.falcon.csv')
+                        ? parsedRole.base.slice(0, -'.falcon.csv'.length)
+                        : parsedRole.name;
+                    const simplifiedOutput = path.join(parsedRole.dir, `simplified-${stem}.json`);
+
+                    simplifiedReporter.generate(results, simplifiedOutput, {
+                        project: config.scanName,
+                        classification: options.classification || '',
+                        date: scanDate,
+                    });
                 }
             }
 
@@ -781,6 +813,10 @@ program
     .option('-H, --header <header...>', 'Extra request header as "Key: Value" (repeatable)')
     .option('-d, --data <body>', 'Request body — a JSON string, or @path/to/file.json')
     .option('-t, --token <token>', 'Bearer token for authentication')
+    .option('-r, --refresh <token>', 'Refresh token — renews the bearer token automatically if it expires mid-check (requires --token)')
+    .option('--token-url <url>', 'OAuth2/OIDC token endpoint used to redeem --refresh. Defaults to the standard Keycloak endpoint derived from the access token\'s "iss" claim.')
+    .option('--client-id <id>', 'OAuth2 client_id used to redeem --refresh. Defaults to the access token\'s "azp"/"client_id" claim.')
+    .option('--client-secret <secret>', 'OAuth2 client_secret, only needed for a confidential client')
     .option('-u, --username <user>', 'Username for Basic Auth')
     .option('-p, --password <pass>', 'Password for Basic Auth')
     .option('--auth-file <path>', 'Path to JSON file containing role:token mapping or login_endpoint config')
@@ -1069,6 +1105,121 @@ program
         } catch (err) {
             logger.error(`JWT analysis failed: ${err.message}`);
             process.exit(1);
+        }
+    });
+
+// -----------------------------------------------------------------------------
+// `refresh` — standalone token-refresh daemon. Independent of `scan`'s mid-scan
+// auto-refresh (Context#ensureFreshToken) — this just keeps one access token
+// alive in your terminal (and optionally a file) for as long as the process runs,
+// e.g. to feed into another tool, a second terminal, or manual curl/Postman use.
+// -----------------------------------------------------------------------------
+program
+    .command('refresh')
+    .description('Continuously refresh a bearer token via its refresh token, printing (and optionally saving) a fresh access token each time the old one is about to expire. Runs until you stop it with Ctrl+C.')
+    .requiredOption('-t, --token <token>', 'Current access token (must be a JWT with an "exp" claim)')
+    .requiredOption('-r, --refresh <token>', 'Refresh token used to renew the access token')
+    .option('--token-url <url>', 'OAuth2/OIDC token endpoint. Defaults to the standard Keycloak endpoint derived from the access token\'s "iss" claim.')
+    .option('--client-id <id>', 'OAuth2 client_id. Defaults to the access token\'s "azp"/"client_id" claim.')
+    .option('--client-secret <secret>', 'OAuth2 client_secret, only needed for a confidential client')
+    .option('-o, --output <path>', 'File to overwrite with the current access token on every refresh — point another tool at this path to always read a live token')
+    .action(async (options) => {
+        try {
+            assertLooksLikeToken(options.token, 'token');
+            assertLooksLikeToken(options.refresh, 'refresh');
+        } catch (err) {
+            logger.error(err.message);
+            process.exit(2);
+        }
+
+        const fs = require('node:fs');
+        const path = require('node:path');
+        const { decode } = require('../core/jwt/jwtCodec');
+        const { refreshAccessToken, REFRESH_SKEW_SECONDS } = require('../core/jwt/tokenRefresher');
+
+        // Floor on how soon we'll fire the *next* refresh after one just completed.
+        // Without it, a token whose actual lifetime is shorter than REFRESH_SKEW_SECONDS
+        // (misconfigured IdP, a non-Keycloak issuer with short-lived tokens, clock drift)
+        // makes every scheduled wait compute to ~0ms — a busy loop hammering the token
+        // endpoint as fast as the event loop allows instead of a periodic refresh.
+        const MIN_REFRESH_INTERVAL_MS = 5000;
+
+        // Throws if `token` isn't a decodable JWT or has no "exp" claim to schedule against.
+        const expiryOf = (token) => {
+            let payload;
+            try {
+                ({ payload } = decode(token));
+            } catch (err) {
+                throw new Error(`Not a decodable JWT: ${err.message}`);
+            }
+            if (!payload.exp) {
+                throw new Error('Token has no "exp" claim — nothing to schedule a refresh against.');
+            }
+            return payload.exp;
+        };
+
+        const writeOutputFile = (token) => {
+            if (!options.output) return;
+            const outPath = path.resolve(options.output);
+            try {
+                fs.mkdirSync(path.dirname(outPath), { recursive: true, mode: 0o700 });
+                // This file holds a live bearer token — owner-only. `mode` on writeFileSync
+                // only applies when the file is first created, so an existing file (made
+                // earlier under a looser umask, or by something else) is chmod'd explicitly
+                // on every write too, since we overwrite this same path on every refresh.
+                fs.writeFileSync(outPath, token, { mode: 0o600 });
+                fs.chmodSync(outPath, 0o600);
+            } catch (err) {
+                logger.error(`Failed to write token to ${outPath}: ${err.message}`);
+            }
+        };
+
+        let currentToken = options.token;
+        let currentRefreshToken = options.refresh;
+        let exp;
+        try {
+            exp = expiryOf(currentToken);
+        } catch (err) {
+            logger.error(err.message);
+            process.exit(2);
+        }
+
+        logger.title('Token refresh loop started — Ctrl+C to stop.');
+        logger.info(`Access token expires at ${new Date(exp * 1000).toISOString()}`);
+        writeOutputFile(currentToken);
+
+        process.on('SIGINT', () => {
+            logger.info('\nStopped.');
+            process.exit(0);
+        });
+
+        // Runs until the process is killed — each iteration sleeps until just before
+        // the current token expires, refreshes, prints/saves the new one, and repeats
+        // with the (possibly rotated — Keycloak rotates by default) refresh token.
+        for (;;) {
+            const waitMs = Math.max(MIN_REFRESH_INTERVAL_MS, (exp - REFRESH_SKEW_SECONDS) * 1000 - Date.now());
+            logger.info(`Next refresh in ${Math.round(waitMs / 1000)}s...`);
+            await new Promise(resolve => setTimeout(resolve, waitMs));
+
+            try {
+                const result = await refreshAccessToken({
+                    currentToken,
+                    refreshToken: currentRefreshToken,
+                    tokenUrl: options.tokenUrl,
+                    clientId: options.clientId,
+                    clientSecret: options.clientSecret,
+                });
+                currentToken = result.accessToken;
+                currentRefreshToken = result.refreshToken;
+                exp = expiryOf(currentToken);
+
+                logger.success(`Refreshed at ${new Date().toISOString()} — new token expires ${new Date(exp * 1000).toISOString()}`);
+                console.log(currentToken);
+                writeOutputFile(currentToken);
+            } catch (err) {
+                logger.error(`Token refresh failed: ${err.message}`);
+                process.exit(1);
+            }
         }
     });
 

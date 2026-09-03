@@ -395,7 +395,7 @@ class Engine {
 
         let probeSpecs;
         try {
-            probeSpecs = await synthesizeProbesBatch(aiProbeItems, endpoint, this._cache, resolvedPath);
+            probeSpecs = await synthesizeProbesBatch(aiProbeItems, endpoint, this._cache, resolvedPath, this.context.getSampleRecords());
         } catch (err) {
             if (this._isAiExhaustionError(err)) {
                 this._disableAiProbes(err);

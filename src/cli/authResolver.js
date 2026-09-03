@@ -4,15 +4,41 @@ const axios = require('axios');
 const logger = require('../utils/logger');
 const { InfrastructureError } = require('../utils/errors');
 
+// A bearer/refresh token is always base64url text (letters, digits, - _ .), never a
+// comma, quote, or colon. Those three characters catch the single most common paste
+// mistake with --token/--refresh: copying straight out of a JSON auth response
+// (e.g. {"token": "...", "refreshToken": "...", "idToken": "..."}) and grabbing one
+// field's surrounding punctuation along with it — which, once the shell drops the
+// quotes around it, silently glues the next field's value onto the end of this one
+// instead of erroring immediately.
+const TOKEN_PASTE_ARTIFACT = /["',]|:\s*"/;
+
+const assertLooksLikeToken = (value, flagName) => {
+    if (!value || !TOKEN_PASTE_ARTIFACT.test(value)) return;
+    throw new Error(
+        `--${flagName} value contains a comma/quote/colon, which is never valid inside a bearer or refresh token. ` +
+        'This usually means a whole JSON blob (e.g. {"token": "...", "refreshToken": "...", "idToken": "..."}) got ' +
+        `pasted in instead of just one field's value — pass only the ${flagName} string itself.`
+    );
+};
+
 /**
  * Resolve a CLI's auth options (--auth-file, --token, --username/--password) into
  * a role => authValue map, same shape the `scan` command has always produced.
  * Shared so single-target commands (e.g. `headers`) don't have to re-implement it.
  *
  * @param {object} options - Commander options object (authFile, token, username, password).
+ * @param {object|null} [collectionAuth] - fallback auth extracted from the input
+ *   collection itself (parser.js's extractCollectionAuth), used only when none of
+ *   the CLI auth options above were given — a scan against a collection that
+ *   already has a working session baked in doesn't need it re-supplied on the
+ *   command line.
  * @returns {Promise<object>} authMap — { roleName: { type, token|username|password|... } }
  */
-const resolveAuthMap = async (options) => {
+const resolveAuthMap = async (options, collectionAuth = null) => {
+    assertLooksLikeToken(options.token, 'token');
+    assertLooksLikeToken(options.refresh, 'refresh');
+
     let authMap = {};
 
     if (options.authFile) {
@@ -109,9 +135,21 @@ const resolveAuthMap = async (options) => {
     } else if (options.token) {
         authMap = { default: { type: 'bearer', token: options.token } };
         logger.info('Using provided bearer token.');
+        if (options.refresh) {
+            Object.assign(authMap.default, {
+                refreshToken: options.refresh,
+                tokenUrl: options.tokenUrl,
+                clientId: options.clientId,
+                clientSecret: options.clientSecret,
+            });
+            logger.info('Refresh token provided — the access token will be renewed automatically if it expires mid-scan.');
+        }
     } else if (options.username && options.password) {
         authMap = { default: { type: 'basic', username: options.username, password: options.password } };
         logger.info('Using provided Basic Auth credentials.');
+    } else if (collectionAuth) {
+        authMap = { default: { ...collectionAuth } };
+        logger.info(`No -t/-u/-p/--auth-file given — using the ${collectionAuth.type} auth already defined in the collection.`);
     } else {
         authMap = { unauthenticated: null };
     }
@@ -134,4 +172,4 @@ const authValueToHeaders = (authValue) => {
     return {};
 };
 
-module.exports = { resolveAuthMap, authValueToHeaders };
+module.exports = { resolveAuthMap, authValueToHeaders, assertLooksLikeToken };

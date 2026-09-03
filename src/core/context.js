@@ -1,4 +1,14 @@
+const { decode } = require('./jwt/jwtCodec');
+const { refreshAccessToken, REFRESH_SKEW_SECONDS } = require('./jwt/tokenRefresher');
+const logger = require('../utils/logger');
+
 class Context {
+    // Bounds how many harvested sample records (see addSampleRecord) a single run
+    // accumulates — plenty to give the probe synthesizer multiple distinct entities
+    // to draw a cross-object pair from, without the prompt payload growing with
+    // collection size.
+    static MAX_SAMPLE_RECORDS = 30;
+
     constructor(config) {
         this.baseUrl = config.base_url;
         this.auth = config.auth || null;
@@ -21,6 +31,21 @@ class Context {
 
         // Variable store for dynamic resolution (e.g., {{booking_id}} -> "123")
         this.store = {};
+
+        // In-flight token refresh (see ensureFreshToken) — deduped across concurrent requests.
+        this._refreshPromise = null;
+
+        // Sample records harvested during discovery (see discovery.js) — real,
+        // distinct entities pulled from list-endpoint responses, each reduced to
+        // just its identifier-shaped fields. Exists so the AI probe layer can test
+        // cross-object identifier confusion (BOLA-01) with genuine foreign IDs
+        // instead of inventing values that wouldn't actually resolve to anything.
+        this.sampleRecords = [];
+        // Dedupes addSampleRecord — discovery re-pings already-resolved list
+        // endpoints on every pass (see discovery.js), which would otherwise queue
+        // the same one or two records repeatedly instead of leaving room for
+        // genuinely different entities from other endpoints.
+        this._seenSampleRecordKeys = new Set();
     }
 
     /**
@@ -32,6 +57,46 @@ class Context {
         const method = (endpoint.methods && endpoint.methods[0]) || 'GET';
         const key = `${method.toUpperCase()} ${endpoint.path}`;
         return this.evidenceStore.get(key);
+    }
+
+    /**
+     * If the current bearer token is a JWT that's expired (or about to expire)
+     * and a refresh token was supplied, exchange it for a new access token and
+     * swap it into this.auth in place — so a long scan's later requests pick up
+     * a live token via getAuthHeaders() instead of failing auth partway through.
+     * No-op for non-bearer auth, a non-JWT token, or one still comfortably valid.
+     * Concurrent callers (e.g. the rate-limit check's parallel requests) share a
+     * single in-flight refresh instead of each spending the (often single-use)
+     * refresh token.
+     */
+    async ensureFreshToken() {
+        if (this.auth?.type !== 'bearer' || !this.auth.refreshToken) return;
+
+        let exp;
+        try {
+            exp = decode(this.auth.token).payload.exp;
+        } catch (e) {
+            return; // not a JWT (or malformed) — nothing we can introspect, leave it alone
+        }
+        if (!exp || exp - Date.now() / 1000 > REFRESH_SKEW_SECONDS) return;
+
+        if (!this._refreshPromise) {
+            this._refreshPromise = refreshAccessToken({
+                currentToken: this.auth.token,
+                refreshToken: this.auth.refreshToken,
+                tokenUrl: this.auth.tokenUrl,
+                clientId: this.auth.clientId,
+                clientSecret: this.auth.clientSecret,
+            }).then((result) => {
+                this.auth.token = result.accessToken;
+                this.auth.refreshToken = result.refreshToken;
+                logger.info('🔄 Bearer token expired mid-scan — refreshed via refresh token.');
+                logger.info(`   New access token: ${result.accessToken}`);
+            }).finally(() => {
+                this._refreshPromise = null;
+            });
+        }
+        return this._refreshPromise;
     }
 
     getAuthHeaders() {
@@ -75,6 +140,29 @@ class Context {
 
     getVariable(key) {
         return this.store[key];
+    }
+
+    /**
+     * Record one harvested sample entity (see discovery.js) — its identifier-shaped
+     * fields only, e.g. { health_id: "...", contact_id: "..." }. Capped so a very
+     * large or very chatty collection can't grow this unbounded across a long scan;
+     * once full, later records are dropped rather than displacing earlier ones, so
+     * results stay stable across a run instead of depending on discovery order.
+     */
+    addSampleRecord(source, record) {
+        if (this.sampleRecords.length >= Context.MAX_SAMPLE_RECORDS) return;
+        if (!record || typeof record !== 'object' || Object.keys(record).length === 0) return;
+
+        const key = `${source}::${JSON.stringify(record)}`;
+        if (this._seenSampleRecordKeys.has(key)) return;
+        this._seenSampleRecordKeys.add(key);
+
+        this.sampleRecords.push({ source, record });
+    }
+
+    /** Harvested sample records — see addSampleRecord. */
+    getSampleRecords() {
+        return this.sampleRecords;
     }
 
     resolveString(input) {

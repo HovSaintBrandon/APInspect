@@ -31,12 +31,33 @@ const createClient = (baseURL, headers = {}, timeout = 5000, context = null, all
 
     const instance = axios.create(axiosConfig);
 
+    // The original default Authorization this client was created with — used below to
+    // tell "this request wants whatever the current default auth is" apart from a check
+    // that deliberately overrode Authorization for that one request (e.g. authRequired.js
+    // sets it to null to test unauthenticated access; a forged-token replay sets it to a
+    // specific value). Only the former should ever be touched by a token refresh.
+    const defaultAuthorization = headers.Authorization;
+
     // Automatically resolve {{variables}} in the URL before request is sent.
     // The URL specifically goes through resolvePath() (not resolveString) since
     // it's always a path, never an arbitrary string — that lets it also collapse
     // "//" left behind by stripping out an embedded {{base_url}}/{{baseUrl}}.
-    instance.interceptors.request.use(req => {
+    instance.interceptors.request.use(async req => {
         if (context && req.url) {
+            // Bearer headers are baked into axios's defaults once, at createClient time
+            // (see adapters/index.js) — refresh here and re-stamp per request so a token
+            // renewed mid-scan (see Context#ensureFreshToken) actually reaches later requests.
+            // Guarded to only fire when this request still carries the original default
+            // (see defaultAuthorization above) — a request that explicitly overrode or
+            // stripped Authorization for its own purposes must not have that clobbered.
+            if (typeof context.ensureFreshToken === 'function' && req.headers.Authorization === defaultAuthorization) {
+                await context.ensureFreshToken();
+                const authHeaders = context.getAuthHeaders();
+                if (authHeaders.Authorization) {
+                    req.headers.Authorization = authHeaders.Authorization;
+                }
+            }
+
             req.url = context.resolvePath(req.url);
 
             // Also resolve variables inside the JSON body (if present)

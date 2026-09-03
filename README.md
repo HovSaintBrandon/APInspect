@@ -86,12 +86,12 @@ Style-specific checks live under `src/checks/graphql/` (introspection exposure, 
 
 ## What Gets Checked
 
-34 checklist items across these categories — full detail in `src/config/checklist.json`:
+35 checklist items across these categories — full detail in `src/config/checklist.json`:
 
 | Category | Examples |
 |---|---|
 | Discovery | Endpoint reachability, dangerous HTTP methods (`TRACE`) |
-| Authentication | Enforcement, server-side token validation, broken object-level authorization (BOLA) |
+| Authentication | Enforcement, server-side token validation, broken object-level authorization (BOLA), cross-object identifier confusion (see below) |
 | Injection | SQLi/XSS fuzzing, path traversal, SSRF-style internal-URL rejection |
 | Data Exposure | Emails, SSNs, private keys, AWS keys, JWTs, Stripe/Google API keys, over-fetching |
 | Misconfigurations | CORS wildcard/reflected-origin, security-header grading (securityheaders.com-style A+–F, see below), version disclosure |
@@ -117,6 +117,18 @@ Style-specific checks live under `src/checks/graphql/` (introspection exposure, 
 - `misconfigurations/securityHeaders` maps the letter grade back to the engine's `PASS`/`WARN`/`FAIL` contract (`A`/`A+`/`B` → `PASS`, `C`/`D` → `WARN`, `E`/`F` → `FAIL`) so it plugs into `--fail-on` gating like any other check.
 
 Grading logic lives entirely in this repo — no third-party API, no rate limits, editable rule set. See the standalone [`apinspect headers <url>`](#apinspect-headers-url--single-url-header-grade-no-scan-required) command below to run just this check against a single URL.
+
+### Cross-Object Identifier Confusion (`BOLA-01`)
+
+Ordinary BOLA testing (`AUTH-03`) manipulates *one* ID in a request and checks whether you land on someone else's object. A subtler, higher-value variant of the same bug shows up when an endpoint accepts *two* independent identifiers in the same request — e.g. a subject ID plus a separately-scoped contact/account/delivery ID (`{"health_id": "...", "contact_id": "..."}`) — and never verifies the two actually belong to the same entity. Pair a victim's subject ID with an attacker-controlled reference ID and the server processes them together anyway: an OTP gets sent to the attacker's phone, a notification to the attacker's email, a payout to the attacker's account — all under the victim's identity.
+
+`BOLA-01` tests for exactly this, and to do it meaningfully it needs *real* foreign identifiers, not guesses — a fabricated ID typically just 404s and proves nothing. So the AI probe layer now:
+- **Sees the endpoint's actual request body schema** (from the collection/spec's own example), not just its method and path — necessary to even notice that an endpoint takes two independent ID fields in the first place.
+- **Harvests real sibling entities during discovery** — every list endpoint APInspect pings now captures up to two distinct records' identifier-shaped fields (`*_id`, `*_uuid`, `*_code`, `*_ref`, `*_number` — never anything password/token/otp/pin/ssn-shaped), not just the one ID it already used for path substitution. This gives the probe synthesizer genuine "record A" / "record B" pairs to mix.
+- **Constructs the mismatch from real data**: one field from record A, a different field from record B — with the probe's `expectation` stating explicitly which value came from which record, so the verdict classifier judges it against a concrete claim.
+- **Never trusts a bare "PASS" on a 2xx response** for this check — the real-world version of this bug returns a normal success response (`"OTP sent successfully"`), so a PASS verdict alongside any 2xx status is automatically downgraded to `TO BE CONFIRMED` regardless of what the model says (`verdictClassifier.js`'s deterministic override, same mechanism already used for `AUTH-*`/`RATE-*`).
+
+Like the rest of the checklist's judgment-call items, `BOLA-01` only runs with an authenticated session (`requires_auth_session`) — but any authenticated role is enough; it doesn't need to be a privileged one, since the vulnerability is that the server never checks *whose* identifiers you supplied, not what your own role can normally do.
 
 ---
 
@@ -179,7 +191,7 @@ This is what `parser.js` reads to build the attack surface (`config.endpoints`, 
 
 | You already have... | Give APInspect... | What happens |
 |---|---|---|
-| A Postman collection you export from Postman | the `.json` export, unmodified | `extractPostmanEndpoints` walks every `item`/folder and flattens it to `{ path, methods }`. You'll be asked (or pass `--style`) to confirm REST vs. GraphQL, since a Postman file alone doesn't say which. If the collection has top-level folders, you'll also be asked which one(s) to scan (or pass `--folder`) — see below. |
+| A Postman collection you export from Postman | the `.json` export, unmodified | `extractPostmanEndpoints` walks every `item`/folder and flattens it to `{ path, methods }`. You'll be asked (or pass `--style`) to confirm REST vs. GraphQL, since a Postman file alone doesn't say which. If the collection has folders — at any nesting depth — you'll also be asked which one(s) to scan (or pass `--folder`): pick a folder to scan it whole, subfolders included, or pick one of its subfolders to scan just that slice — see below. |
 | An OpenAPI/Swagger spec | the `.json`/`.yaml`/`.yml` file | `openapiAdapter` parses `paths` into endpoints automatically. |
 | A GraphQL schema | a `.graphql`/`.gql` SDL file, or just the live endpoint URL | `graphqlAdapter` builds endpoints from the schema, or introspects the live URL directly — no manual endpoint list needed either way. |
 | A gRPC service | the `.proto` file + `-b host:port` | `grpcAdapter` reflects the service definition into endpoints (one per RPC method). |
@@ -273,9 +285,10 @@ apinspect scan <file> [options]
 | `-u, --username <user>` / `-p, --password <pass>` | Basic Auth credentials |
 | `-b, --base-url <url>` | Base URL for REST/GraphQL, or `host:port` for a gRPC target |
 | `--style <rest\|graphql\|grpc>` | Architecture style. Skips the interactive prompt for ambiguous inputs. |
-| `-f, --folder <name...>` | Restrict a Postman collection scan to specific top-level folder(s) by name. Skips the interactive folder-picker prompt shown when the collection has folders. |
+| `-f, --folder <name...>` | Restrict a Postman collection scan to specific folder(s) by name, at any nesting depth — pass `"Parent/Child"` if the same name shows up under more than one parent. Skips the interactive folder-picker prompt shown when the collection has folders. |
 | `--auth-file <path>` | Multi-role auth config — see [Authentication](#authentication) |
 | `--checklist` | Enable AI-driven checklist mode (recommended — otherwise a smaller hardcoded legacy check list runs) |
+| `--classification <text>` | Classification banner (e.g. `"C2 - Internal"`) stamped on the [simplified report](#reports) that's written alongside every `--checklist` run. Omit it and the field is left blank. |
 | `--cache <path>` | Persist AI applicability/probe decisions to a file — reused on the next run against an unchanged target, and committable for deterministic CI runs |
 | `-o, --output <path>` | Report path — `.json`, `.csv`, or `.falcon.csv` (review spreadsheet format). Omit it and the report is written to `reports/<collection-or-folder-name>/report-<timestamp>.json` — the directory tracks the collection (or the `-f/--folder` name, when scoped) so repeat scans of the same input land together, while the timestamped file name keeps every run from overwriting the last. |
 | `--fail-on <severity>` | Exit code 1 if any confirmed finding meets/exceeds this severity: `critical`, `high`, `medium`, `low`, `info` |
@@ -417,11 +430,36 @@ apinspect jwt "eyJhbGciOi..." \
 
 Any forged token the live test marks `accepted` is surfaced as a `critical` finding — that's a demonstrated auth bypass, not a theoretical one. With `--ai`, everything (decoded header/payload, static findings, live results) is handed to the AI for a prioritized risk summary and specific mitigations, printed after the deterministic output and included in the JSON output under `aiAnalysis` when `-o` is used.
 
+### `apinspect refresh` — standalone token-refresh loop
+
+Give it a bearer token and its refresh token, and it keeps that token alive for as long as the process runs — refreshing it shortly before every expiry, printing the fresh token to stdout, and (optionally) writing it to a file so another terminal or tool can always read a live token. Independent of `scan`'s own mid-scan auto-refresh (below) — this is for keeping a token alive outside of a scan, e.g. for manual `curl`/Postman use against a short-lived-token environment. Runs until you stop it with **Ctrl+C**.
+
+```bash
+apinspect refresh -t <token> -r <refresh-token> [options]
+```
+
+| Option | Description |
+|---|---|
+| `-t, --token <token>` | Current access token — must be a JWT with an `exp` claim (required) |
+| `-r, --refresh <token>` | Refresh token used to renew the access token (required) |
+| `--token-url <url>` | OAuth2/OIDC token endpoint. Defaults to the standard Keycloak endpoint derived from the access token's `iss` claim. |
+| `--client-id <id>` | OAuth2 `client_id`. Defaults to the access token's `azp`/`client_id` claim. |
+| `--client-secret <secret>` | OAuth2 `client_secret`, only needed for a confidential client |
+| `-o, --output <path>` | File to overwrite with the current access token on every refresh |
+
+```bash
+apinspect refresh -t "$ACCESS_TOKEN" -r "$REFRESH_TOKEN" -o .apinspect-token
+# in another terminal:
+apinspect scan collection.json --checklist -b https://api-dev.example.com -t "$(cat .apinspect-token)"
+```
+
+Each token is refreshed 30 seconds before it actually expires; if a token's real lifetime is ever shorter than that (a misconfigured IdP, an unusually short-lived token), refreshes are still floored at one every 5 seconds rather than hammering the token endpoint in a busy loop. A hard refresh failure (e.g. the refresh token was rejected) stops the process with a non-zero exit code rather than retrying forever against a token that's no longer valid.
+
 ---
 
 ## Authentication
 
-Four ways to authenticate a scan, in priority order:
+Five ways to authenticate a scan, in priority order:
 
 **1. Single bearer token**
 ```bash
@@ -462,7 +500,16 @@ Or, per-role with mixed auth types (no shared login endpoint needed):
 apinspect scan api.json --auth-file apinspect_auth.json --checklist -b https://api.example.com
 ```
 
-**4. No auth** — scans unauthenticated; `authRequired`/`AUTH-01` still verifies the API correctly rejects it.
+**4. Auth already defined in the Postman collection** — if none of the above are given and the input is a Postman collection with its own collection-level `auth` block (`bearer`, `basic`, or a header-mode `apikey`) carrying a real, resolved value (not an unfilled `{{env_var}}` template that would need a Postman environment file this parser doesn't load), that's used automatically:
+
+```bash
+apinspect scan captured-session.postman_collection.json --checklist -b https://api-dev.example.com
+# → "Collection defines its own bearer auth — used automatically if no -t/-u/-p/--auth-file is given."
+```
+
+Useful for a working collection captured mid-engagement with a live session already baked in — no need to re-paste the same token as `-t`. Any of options 1–3 above still take priority if given.
+
+**5. No auth** — scans unauthenticated; `authRequired`/`AUTH-01` still verifies the API correctly rejects it.
 
 ---
 
@@ -609,7 +656,7 @@ where `ci/apinspect_auth.template.json` (safe to commit) contains `"password": "
 
 Key points for CI:
 - Always pass `--style` explicitly in CI — with no TTY attached, the interactive style prompt for ambiguous inputs (Postman/OpenAPI/raw JSON) will hang the job waiting for input it will never receive.
-- If the Postman collection has top-level folders, also pass `--folder` explicitly in CI (or scan a flat collection) — otherwise the interactive folder-picker prompt will hang the job the same way.
+- If the Postman collection has folders (at any nesting depth), also pass `--folder` explicitly in CI (or scan a flat collection) — otherwise the interactive folder-picker prompt will hang the job the same way.
 - Store `OPENROUTER_API_KEY` and any `auth-file` credentials as encrypted CI secrets, never in the repo.
 - Commit a `--cache` file to the repo (or restore it from a CI cache action) so PR runs reuse prior AI decisions instead of re-synthesizing probes on every push — faster and cheaper.
 - Use `if: always()` on the report-upload step so you get the partial report even when the scan fails or aborts on an infrastructure error (exit code 3).
@@ -759,12 +806,33 @@ On a code-`3` abort the console also prints a summary of whatever was recorded b
 | JSON | default, or `-o report.json` | Machine-readable; feed into other tooling |
 | CSV | `-o report.csv` | Spreadsheet-friendly flat export |
 | FALCON review | `-o report.falcon.csv` | Purpose-built triage spreadsheet — grouped by severity/category for manual review sign-off |
+| Simplified (JSON) | automatic, alongside every `--checklist` run | Flat, client-facing audit matrix — see below |
 
 Each result includes `check`, `endpoint`, `method`, `status`, `severity`, `confirmation_status`, `message`, a full `evidence_trail` (request/response pair, whenever a request was actually sent — hardcoded checks and AI-driven ones alike) for auditability, and — for AI-driven checks specifically — `ai_confidence`, `ai_reasoning`, `evidence_cited`.
 
 `status` is one of: `PASS`, `FAIL`, `N/A` (genuinely not applicable to this endpoint/protocol), `MANUAL` / `TO BE CONFIRMED` (a real evaluation was attempted but needs human judgment), or a coverage-gap status — `AUTH_BLOCKED` (request was stopped by a 401/403 before the check under test could run), `ROUTE_NOT_FOUND` (404 — no route matched, so nothing about the endpoint could be evaluated), `ENDPOINT_UNHEALTHY` (a baseline request 5xx'd, so dependent checks were skipped as unreliable), or `UNRESOLVED_PATH` (the spec's path template never resolved to a real URL, so no request was sent at all). Coverage-gap statuses are never folded into `PASS`/`N/A` — the JSON report's `summary` block breaks them out individually plus a `coverage.coverage_pct` (evaluated ÷ applicable), so a high pass count can't quietly hide low real coverage.
 
 When scanning with a multi-role `--auth-file`, per-role reports are written automatically (e.g. `report.student.json`, `report.admin.json`) alongside the combined run.
+
+### Simplified report
+
+Every `--checklist` run additionally writes a `simplified-report-*.json` next to the primary report (`simplified-report.student.json` etc. for per-role runs). It's a flat, client-facing audit matrix — one entry per checklist item, independent of output format (`-o`):
+
+```jsonc
+{
+  "project": "<collection/folder or report name — same value used for the reports/ directory>",
+  "date": "03.09.26",              // DD.MM.YY, the date the scan ran
+  "classification": "",            // from --classification, blank if not passed
+  "id": 1,                         // sequential, in checklist.json order
+  "domain": "API",
+  "subject": "Discovery",          // checklist item's category
+  "test": "Identify all accessible API endpoints and verify they are documented.",
+  "results": { "/policy/assign": "PASS" },  // every tested endpoint's verdict, keyed by path
+  "comment": ""                    // left blank for a reviewer to fill in by hand
+}
+```
+
+An item never exercised by the scan still gets a row, with `results: {}`.
 
 ---
 

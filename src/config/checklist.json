@@ -57,6 +57,18 @@
     ]
   },
   {
+    "id": "BOLA-01",
+    "category": "Authentication",
+    "severity": "Critical",
+    "test_name": "Test for cross-object identifier confusion — when a request body or query carries two or more independent entity identifiers (e.g. a subject ID plus a separate contact/account/delivery ID), pair one entity's identifier with an unrelated entity's identifier and verify the server rejects the mismatch rather than processing them together (OWASP API1:2023 BOLA via an unbound reference).",
+    "maps_to_check": null,
+    "requires_ai_probe": true,
+    "requires_auth_session": true,
+    "applies_to": [
+      "rest"
+    ]
+  },
+  {
     "id": "INJ-01",
     "category": "Injection",
     "severity": "Critical",

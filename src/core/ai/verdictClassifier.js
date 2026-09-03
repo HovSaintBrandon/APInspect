@@ -90,6 +90,14 @@ function _findPassOverride(checkId, httpResponse, safeBody) {
     if (checkId.startsWith('RATE-') && resStatus !== 429) {
         return `${checkId} AI returned PASS but status was ${resStatus} (expected 429).`;
     }
+    // BOLA-01 (cross-object identifier confusion): a PASS means the server rejected
+    // the mismatched identifier pair. A 2xx response is the exact shape the real-world
+    // version of this bug takes (e.g. "OTP sent successfully" to an unrelated contact) —
+    // never a legitimate rejection — so a PASS alongside one is always suspect, not just
+    // "unexpected" the way a stricter-than-401/403 rejection code would be.
+    if (checkId.startsWith('BOLA-') && resStatus >= 200 && resStatus < 300) {
+        return `${checkId} AI returned PASS but status was ${resStatus} — a 2xx response cannot demonstrate the server rejected a mismatched identifier pair.`;
+    }
 
     const acao = httpResponse.headers?.['access-control-allow-origin'] || '';
     const acac = httpResponse.headers?.['access-control-allow-credentials'] || '';
